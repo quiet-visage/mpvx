@@ -29,6 +29,12 @@ tasks:
       - cmake --preset dev-release
       - cmake --build --preset dev-release -j
 
+  install:
+    desc: Build and install the release build (default PREFIX=$HOME/.local)
+    deps: [build:release]
+    cmds:
+      - cmake --install build/dev-release --prefix {{if .PREFIX}}"{{.PREFIX}}"{{else}}"$HOME/.local"{{end}}
+
   build:sanitize:
     desc: Configure and build with Address and Undefined Behavior Sanitizers (dev-sanitize)
     cmds:

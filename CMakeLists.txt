@@ -49,6 +49,7 @@ endif()
 add_library(mpvx_core
     src/player.cpp
     src/renderer.cpp
+    src/library.cpp
 )
 
 target_include_directories(mpvx_core
@@ -93,9 +94,10 @@ slint_target_sources(mpvx
 # Linker RPATH & rpath-link configuration for Linux
 if(UNIX AND NOT APPLE)
     set(_DEPS_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps/libmpv/lib")
-    get_target_property(_SLINT_LOC Slint::Slint IMPORTED_LOCATION)
-    if(_SLINT_LOC)
-        get_filename_component(_SLINT_DIR "${_SLINT_LOC}" DIRECTORY)
+    if(Slint_DIR)
+        get_filename_component(_SLINT_DIR "${Slint_DIR}/../.." ABSOLUTE)
+    endif()
+    if(_SLINT_DIR)
         set_target_properties(mpvx PROPERTIES
             BUILD_RPATH "${_SLINT_DIR};${_DEPS_LIB_DIR}"
             INSTALL_RPATH "${_SLINT_DIR};${_DEPS_LIB_DIR}"
@@ -109,6 +111,14 @@ if(UNIX AND NOT APPLE)
         )
     endif()
 endif()
+
+# ==============================================================================
+# Installation
+# ==============================================================================
+include(GNUInstallDirs)
+install(TARGETS mpvx
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 # ==============================================================================
 # Testing

@@ -1,6 +1,8 @@
 add_executable(mpvx_tests
     test_player.cpp
     test_controls_ui.cpp
+    test_library.cpp
+    test_picker_ui.cpp
 )
 
 target_link_libraries(mpvx_tests
