@@ -1,0 +1,223 @@
+import { Theme, VideoEntry } from "../../theme.slint";
+
+export component VideoCard inherits Rectangle {
+    in property <VideoEntry> entry;
+    in property <length> card-width: 224px;
+
+    callback clicked(string /* path */, bool /* resume */);
+    callback request-thumbnail(string /* id */, string /* path */);
+    callback context-menu-requested(VideoEntry, length /* x */, length /* y */);
+
+    property <length> thumb-height: root.card-width * 9 / 16;
+    property <bool> hovered: card-touch.has-hover || menu-touch.has-hover;
+
+    width: root.card-width;
+    height: root.thumb-height + 54px;
+    background: transparent;
+
+    accessible-role: button;
+    accessible-label: root.entry.title;
+
+    init => {
+        if (!root.entry.has-thumbnail && root.entry.path != "") {
+            root.request-thumbnail(root.entry.id, root.entry.path);
+        }
+    }
+
+    VerticalLayout {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        spacing: 8px;
+
+        // 16:9 Clipped Thumbnail Frame
+        thumb-frame := Rectangle {
+            width: root.card-width;
+            height: root.thumb-height;
+            border-radius: Theme.card-radius;
+            background: Theme.card-bg;
+            border-width: 1px;
+            border-color: root.hovered ? Theme.card-border-hover : Theme.card-border;
+            clip: true;
+            animate border-color { duration: 160ms; easing: ease-out; }
+
+            // Placeholder film icon before thumbnail loads
+            if !root.entry.has-thumbnail : Image {
+                source: @image-url("../../assets/icons/film.svg");
+                width: 28px;
+                height: 28px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: Theme.icon-disabled;
+            }
+
+            // Cached Thumbnail with subtle 1.0 -> 1.035 hover scale
+            if root.entry.has-thumbnail : Image {
+                property <float> scale-factor: root.hovered ? 1.035 : 1.0;
+                animate scale-factor { duration: 160ms; easing: ease-out; }
+                width: parent.width * scale-factor;
+                height: parent.height * scale-factor;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                source: root.entry.thumbnail;
+                image-fit: cover;
+            }
+
+            // Hover dark vignette + centered Play button
+            Rectangle {
+                width: 100%;
+                height: 100%;
+                background: #00000040;
+                opacity: root.hovered ? 1.0 : 0.0;
+                animate opacity { duration: 160ms; easing: ease-out; }
+
+                Rectangle {
+                    width: 44px;
+                    height: 44px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 22px;
+                    background: #00000099;
+                    border-width: 1px;
+                    border-color: #ffffff40;
+
+                    Image {
+                        source: @image-url("../../assets/icons/play.svg");
+                        width: 18px;
+                        height: 18px;
+                        x: (parent.width - self.width) / 2 + 1px;
+                        y: (parent.height - self.height) / 2;
+                        colorize: Theme.icon-primary;
+                    }
+                }
+            }
+
+            // Top-Right Watched Checkmark Pill (progress >= 0.95 or watched)
+            if root.entry.watched || root.entry.progress >= 0.95 : Rectangle {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                width: 22px;
+                height: 22px;
+                border-radius: 11px;
+                background: Theme.pill-bg;
+                border-width: 1px;
+                border-color: #ffffff24;
+
+                Image {
+                    source: @image-url("../../assets/icons/check.svg");
+                    width: 13px;
+                    height: 13px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.icon-accent;
+                }
+            }
+
+            // Top-Left Hover Context Action (...) Button
+            Rectangle {
+                x: 8px;
+                y: 8px;
+                width: 26px;
+                height: 26px;
+                border-radius: 13px;
+                background: menu-touch.has-hover ? #000000cc : Theme.pill-bg;
+                border-width: 1px;
+                border-color: #ffffff24;
+                opacity: root.hovered ? 1.0 : 0.0;
+                animate opacity { duration: 140ms; easing: ease-out; }
+
+                Image {
+                    source: @image-url("../../assets/icons/more-horizontal.svg");
+                    width: 14px;
+                    height: 14px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.icon-primary;
+                }
+
+                menu-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.context-menu-requested(root.entry, root.absolute-position.x + 8px, root.absolute-position.y + 38px);
+                    }
+                }
+            }
+
+            // Bottom-Right Duration Pill
+            if root.entry.duration-text != "" && root.entry.duration-text != "--:--" : Rectangle {
+                x: parent.width - self.width - 8px;
+                y: parent.height - self.height - (root.entry.progress > 0.0 ? 10px : 8px);
+                width: dur-label.preferred-width + 12px;
+                height: 20px;
+                border-radius: 4px;
+                background: Theme.pill-bg;
+
+                dur-label := Text {
+                    text: root.entry.duration-text;
+                    font-size: 11px;
+                    font-weight: 500;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // YouTube-Style Bottom Watch Progress Bar
+            if root.entry.progress > 0.0 : Rectangle {
+                x: 0px;
+                y: parent.height - self.height;
+                width: parent.width;
+                height: root.hovered ? 4px : 3px;
+                background: Theme.progress-track;
+                animate height { duration: 140ms; easing: ease-out; }
+
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width * clamp(root.entry.progress, 0.0, 1.0);
+                    height: 100%;
+                    background: Theme.progress-fill;
+                }
+            }
+
+            // Main Card Click & Right-Click Area
+            card-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.clicked(root.entry.path, root.entry.progress >= 0.05 && root.entry.progress < 0.95 && !root.entry.watched);
+                }
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                        root.context-menu-requested(
+                            root.entry,
+                            root.absolute-position.x + self.mouse-x,
+                            root.absolute-position.y + self.mouse-y);
+                    }
+                }
+            }
+        }
+
+        // Metadata Block
+        VerticalLayout {
+            spacing: 2px;
+
+            Text {
+                text: root.entry.title;
+                font-size: 13px;
+                font-weight: 500;
+                color: Theme.text-primary;
+                overflow: elide;
+                wrap: word-wrap;
+                height: 32px;
+            }
+
+            Text {
+                text: root.entry.subtitle;
+                font-size: 11px;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+        }
+    }
+}

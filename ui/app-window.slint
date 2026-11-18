@@ -1,10 +1,38 @@
-import { Theme, LoopMode, AbLoopState, ActivePopover, TrackItem, ChapterItem } from "theme.slint";
+import {
+    Theme,
+    LoopMode,
+    AbLoopState,
+    ActivePopover,
+    TrackItem,
+    ChapterItem,
+    AppViewMode,
+    PickerNavKind,
+    PickerSortMode,
+    VideoEntry,
+    FolderNode,
+    ShelfSection,
+    VideoGridRow,
+} from "theme.slint";
 import { VideoView } from "components/video-view.slint";
 import { TopBar } from "components/top-bar.slint";
 import { ControlsBar } from "components/controls.slint";
 import { PopoverLayer } from "components/popovers.slint";
+import { VideoPicker } from "components/picker/video-picker.slint";
 
-export { LoopMode, AbLoopState, ActivePopover, TrackItem, ChapterItem }
+export {
+    LoopMode,
+    AbLoopState,
+    ActivePopover,
+    TrackItem,
+    ChapterItem,
+    AppViewMode,
+    PickerNavKind,
+    PickerSortMode,
+    VideoEntry,
+    FolderNode,
+    ShelfSection,
+    VideoGridRow,
+}
 
 export component MainWindow inherits Window {
     no-frame: true;
@@ -45,6 +73,25 @@ export component MainWindow inherits Window {
     in-out property <float> playback-speed: 1.0;
     in-out property <string> hwdec-mode: "auto-safe";
     in-out property <string> aspect-ratio: "auto";
+
+    // --- View Mode & Video Picker State ---
+    in-out property <AppViewMode> view-mode: AppViewMode.Picker;
+    in-out property <bool> sidebar-open: true;
+    in-out property <PickerNavKind> active-nav-kind: PickerNavKind.Home;
+    in-out property <PickerSortMode> picker-sort-mode: PickerSortMode.Name;
+    in-out property <string> current-folder-path: "";
+    in property <[FolderNode]> picker-folders: [];
+    in property <[string]> picker-breadcrumbs: [];
+    in property <[VideoEntry]> picker-continue-watching: [];
+    in property <[VideoEntry]> picker-direct-videos: [];
+    in property <[VideoGridRow]> picker-direct-video-rows: [];
+    in property <int> picker-grid-columns: 4;
+    in property <[ShelfSection]> picker-shelves: [];
+    in-out property <string> picker-search-query: "";
+    in property <bool> picker-scanning: false;
+
+    property <float> picker-opacity: root.view-mode == AppViewMode.Picker ? 1.0 : 0.0;
+    animate picker-opacity { duration: 220ms; easing: ease-out; }
 
     // --- Window & HUD State ---
     in-out property <bool> is-fullscreen: false;
@@ -88,6 +135,22 @@ export component MainWindow inherits Window {
     callback close-clicked();
     callback window-drag-requested(float, float); // delta-x, delta-y in logical px
     callback viewport-resized(int, int);
+
+    // --- Video Picker Callbacks ---
+    callback picker-nav-selected(PickerNavKind, string /* path */);
+    callback picker-folder-toggled(string /* path */);
+    callback picker-breadcrumb-clicked(int /* index */);
+    callback picker-navigate-up();
+    callback picker-video-clicked(string /* path */, bool /* resume */);
+    callback picker-mark-watched(string /* path */, bool /* watched */);
+    callback picker-reveal-in-file-manager(string /* path */);
+    callback picker-request-thumbnail(string /* cache_key_hex */, string /* path */);
+    callback picker-grid-columns-changed(int /* columns */);
+    callback picker-search-changed(string);
+    callback picker-sort-changed(PickerSortMode);
+    callback picker-open-external-folder();
+    callback return-to-picker-clicked();
+    callback return-to-player-clicked();
 
     function reset-hud-timer() {
         root.pointer-idle-ms = 0;
@@ -177,6 +240,37 @@ export component MainWindow inherits Window {
             open-clicked => { root.open-file-clicked(); }
         }
 
+        // 1.5 Video Picker Library Layer (Crossfade over VideoView)
+        VideoPicker {
+            visible: root.view-mode == AppViewMode.Picker || root.picker-opacity > 0.01;
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            opacity: root.picker-opacity;
+            sidebar-open: root.sidebar-open;
+            active-nav-kind: root.active-nav-kind;
+            folders: root.picker-folders;
+            breadcrumbs: root.picker-breadcrumbs;
+            continue-watching: root.picker-continue-watching;
+            direct-video-rows: root.picker-direct-video-rows;
+            grid-columns: root.picker-grid-columns;
+            shelves: root.picker-shelves;
+            scanning: root.picker-scanning;
+            search-query: root.picker-search-query;
+
+            nav-selected(kind, path) => { root.picker-nav-selected(kind, path); }
+            folder-toggled(path) => { root.picker-folder-toggled(path); }
+            breadcrumb-clicked(idx) => { root.picker-breadcrumb-clicked(idx); }
+            video-clicked(path, resume) => { root.picker-video-clicked(path, resume); }
+            mark-watched(path, watched) => { root.picker-mark-watched(path, watched); }
+            reveal-in-file-manager(path) => { root.picker-reveal-in-file-manager(path); }
+            request-thumbnail(id, path) => { root.picker-request-thumbnail(id, path); }
+            grid-columns-changed(cols) => { root.picker-grid-columns-changed(cols); }
+            open-file-clicked => { root.open-file-clicked(); }
+            open-folder-clicked => { root.picker-open-external-folder(); }
+        }
+
         // 2. Backdrop Dismissal Layer for Active Popovers
         if root.active-popover != ActivePopover.None : TouchArea {
             x: 0px;
@@ -197,8 +291,13 @@ export component MainWindow inherits Window {
             media-title: root.media-title;
             is-maximized: root.is-maximized;
             is-fullscreen: root.is-fullscreen;
+            view-mode: root.view-mode;
+            sidebar-open: root.sidebar-open;
+            has-video: root.has-video;
+            picker-search-query <=> root.picker-search-query;
+            picker-sort-mode <=> root.picker-sort-mode;
             active-popover <=> root.active-popover;
-            opacity: (root.hud-visible || root.hud-locked) ? 1.0 : 0.0;
+            opacity: (root.view-mode == AppViewMode.Picker || root.hud-visible || root.hud-locked) ? 1.0 : 0.0;
             animate opacity { duration: 220ms; easing: ease-out; }
 
             pointer-activity => { root.reset-hud-timer(); }
@@ -206,6 +305,11 @@ export component MainWindow inherits Window {
             maximize-toggled => { root.maximize-toggled(); }
             close-clicked => { root.close-clicked(); }
             window-drag-requested(dx, dy) => { root.window-drag-requested(dx, dy); }
+            toggle-sidebar-clicked => { root.sidebar-open = !root.sidebar-open; }
+            return-to-picker-clicked => { root.return-to-picker-clicked(); }
+            return-to-player-clicked => { root.return-to-player-clicked(); }
+            picker-search-changed(q) => { root.picker-search-changed(q); }
+            picker-sort-changed(m) => { root.picker-sort-changed(m); }
         }
 
         // 4. Bottom Gradient Overlay Bar (104px)
@@ -213,6 +317,7 @@ export component MainWindow inherits Window {
             x: 0px;
             y: parent.height - self.height;
             width: 100%;
+            visible: root.view-mode == AppViewMode.Player;
             is-playing: root.is-playing;
             progress: root.progress;
             time-text: root.time-text;
@@ -226,7 +331,7 @@ export component MainWindow inherits Window {
             chapters: root.chapters;
             is-fullscreen: root.is-fullscreen;
             active-popover <=> root.active-popover;
-            opacity: (root.hud-visible || root.hud-locked) ? 1.0 : 0.0;
+            opacity: (root.view-mode == AppViewMode.Player && (root.hud-visible || root.hud-locked)) ? 1.0 : 0.0;
             animate opacity { duration: 220ms; easing: ease-out; }
 
             pointer-activity => { root.reset-hud-timer(); }
@@ -291,6 +396,33 @@ export component MainWindow inherits Window {
         key-pressed(event) => {
             root.reset-hud-timer();
 
+            if (root.view-mode == AppViewMode.Picker) {
+                if (event.modifiers.control && (event.text == "b" || event.text == "B")) {
+                    root.sidebar-open = !root.sidebar-open;
+                    return accept;
+                }
+                if (event.text == "/" || (event.modifiers.control && (event.text == "f" || event.text == "F"))) {
+                    top-bar.focus-search();
+                    return accept;
+                }
+                if (event.text == Key.Backspace && !top-bar.search-focused) {
+                    root.picker-navigate-up();
+                    return accept;
+                }
+                if (event.text == Key.Escape) {
+                    if (root.picker-search-query != "") {
+                        root.picker-search-query = "";
+                        root.picker-search-changed("");
+                        key-scope.focus();
+                        return accept;
+                    } else if (root.has-video) {
+                        root.return-to-player-clicked();
+                        return accept;
+                    }
+                }
+                return reject;
+            }
+
             if (event.text == " " || event.text == "k" || event.text == "K") {
                 root.play-pause-clicked();
                 return accept;
@@ -333,6 +465,9 @@ export component MainWindow inherits Window {
                     return accept;
                 } else if (root.is-fullscreen) {
                     root.fullscreen-toggled();
+                    return accept;
+                } else {
+                    root.return-to-picker-clicked();
                     return accept;
                 }
             }

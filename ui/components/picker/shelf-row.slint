@@ -1,0 +1,114 @@
+import { Theme, VideoEntry, ShelfSection } from "../../theme.slint";
+import { VideoCard } from "video-card.slint";
+
+export component ShelfRow inherits Rectangle {
+    in property <ShelfSection> section;
+    in property <bool> show-see-all: true;
+    in property <length> card-width: 224px;
+
+    callback see-all-clicked(string /* folder_path */);
+    callback video-clicked(string /* path */, bool /* resume */);
+    callback request-thumbnail(string /* id */, string /* path */);
+    callback context-menu-requested(VideoEntry, length, length);
+
+    height: root.section.items.length > 0 ? (root.card-width * 9 / 16 + 106px) : 44px;
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 12px;
+
+        // Shelf Header
+        HorizontalLayout {
+            height: 28px;
+            padding-left: 4px;
+            padding-right: 4px;
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+
+                Text {
+                    text: root.section.title;
+                    font-size: 15px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+
+                if root.section.total-count > 0 : Text {
+                    text: root.section.total-count;
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-muted;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.show-see-all : Rectangle {
+                width: see-all-layout.preferred-width + 12px;
+                height: 28px;
+                border-radius: 6px;
+                background: see-all-touch.has-hover ? Theme.popover-item-hover : transparent;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                see-all-layout := HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: see-all-touch.has-hover ? 4px : 2px;
+                    alignment: center;
+                    animate spacing { duration: 120ms; easing: ease-out; }
+
+                    Text {
+                        text: "See all";
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: see-all-touch.has-hover ? Theme.text-primary : Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+
+                    Image {
+                        source: @image-url("../../assets/icons/chevron-right.svg");
+                        width: 14px;
+                        height: 14px;
+                        y: (parent.height - self.height) / 2;
+                        colorize: see-all-touch.has-hover ? Theme.text-primary : Theme.text-muted;
+                    }
+                }
+
+                see-all-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.see-all-clicked(root.section.folder-path);
+                    }
+                }
+            }
+        }
+
+        // Horizontal Scrollable Shelf Cards
+        if root.section.items.length > 0 : Rectangle {
+            height: root.card-width * 9 / 16 + 58px;
+            clip: true;
+
+            shelf-flick := Flickable {
+                width: 100%;
+                height: 100%;
+                content-width: max(self.width, root.section.items.length * (root.card-width + 16px));
+                content-height: self.height;
+
+                HorizontalLayout {
+                    spacing: 16px;
+                    alignment: start;
+
+                    for item in root.section.items : VideoCard {
+                        entry: item;
+                        card-width: root.card-width;
+                        clicked(path, resume) => { root.video-clicked(path, resume); }
+                        request-thumbnail(id, path) => { root.request-thumbnail(id, path); }
+                        context-menu-requested(e, x, y) => { root.context-menu-requested(e, x, y); }
+                    }
+                }
+            }
+        }
+    }
+}

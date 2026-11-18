@@ -1,0 +1,359 @@
+import { ListView } from "std-widgets.slint";
+import {
+    Theme,
+    PickerNavKind,
+    VideoEntry,
+    FolderNode,
+    ShelfSection,
+    VideoGridRow,
+} from "../../theme.slint";
+import { PickerSidebar } from "sidebar.slint";
+import { VideoCard } from "video-card.slint";
+import { ShelfRow } from "shelf-row.slint";
+
+export component VideoPicker inherits Rectangle {
+    in property <bool> sidebar-open: true;
+    in property <PickerNavKind> active-nav-kind: PickerNavKind.Home;
+    in property <[FolderNode]> folders: [];
+    in property <[string]> breadcrumbs: [];
+    in property <[VideoEntry]> continue-watching: [];
+    in property <[VideoGridRow]> direct-video-rows: [];
+    in property <int> grid-columns: 4;
+    in property <[ShelfSection]> shelves: [];
+    in property <bool> scanning: false;
+    in property <string> search-query: "";
+
+    callback nav-selected(PickerNavKind, string /* path */);
+    callback folder-toggled(string /* path */);
+    callback breadcrumb-clicked(int /* index */);
+    callback video-clicked(string /* path */, bool /* resume */);
+    callback mark-watched(string /* path */, bool /* watched */);
+    callback reveal-in-file-manager(string /* path */);
+    callback request-thumbnail(string /* id */, string /* path */);
+    callback grid-columns-changed(int /* columns */);
+    callback open-file-clicked();
+    callback open-folder-clicked();
+
+    property <bool> context-menu-open: false;
+    property <VideoEntry> context-entry;
+    property <length> context-x: 0px;
+    property <length> context-y: 0px;
+
+    background: Theme.picker-bg;
+    clip: true;
+
+    HorizontalLayout {
+        padding-top: Theme.top-bar-content-height + 4px;
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-bottom: 12px;
+        spacing: root.sidebar-open ? 14px : 0px;
+
+        // Left: Raised, Rounded Sidebar
+        PickerSidebar {
+            open: root.sidebar-open;
+            active-nav-kind: root.active-nav-kind;
+            folders: root.folders;
+
+            nav-selected(kind, path) => { root.nav-selected(kind, path); }
+            folder-toggled(path) => { root.folder-toggled(path); }
+            open-file-clicked => { root.open-file-clicked(); }
+            open-folder-clicked => { root.open-folder-clicked(); }
+        }
+
+        // Right: Main Content Pane
+        main-pane := Rectangle {
+            horizontal-stretch: 1;
+            background: transparent;
+            clip: true;
+
+            property <int> computed-cols: clamp(Math.floor((self.width - 16px) / 236px), 2, 8);
+            property <length> dynamic-card-width: max(180px, (self.width - 24px - (self.computed-cols - 1) * 16px) / self.computed-cols);
+
+            changed computed-cols => {
+                root.grid-columns-changed(self.computed-cols);
+            }
+
+            VerticalLayout {
+                spacing: 14px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                // Breadcrumb Bar
+                if root.breadcrumbs.length > 0 : HorizontalLayout {
+                    height: 28px;
+                    spacing: 4px;
+                    alignment: start;
+
+                    for crumb[idx] in root.breadcrumbs : HorizontalLayout {
+                        spacing: 4px;
+
+                        if idx > 0 : Image {
+                            source: @image-url("../../assets/icons/chevron-right.svg");
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                            colorize: Theme.icon-muted;
+                        }
+
+                        Rectangle {
+                            width: crumb-txt.preferred-width + 12px;
+                            height: 26px;
+                            border-radius: 6px;
+                            background: crumb-touch.has-hover ? Theme.popover-item-hover : transparent;
+                            animate background { duration: 120ms; easing: ease-out; }
+
+                            crumb-txt := Text {
+                                text: crumb;
+                                font-size: 13px;
+                                font-weight: idx == root.breadcrumbs.length - 1 ? 600 : 500;
+                                color: idx == root.breadcrumbs.length - 1 ? Theme.text-primary : Theme.text-muted;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            crumb-touch := TouchArea {
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => { root.breadcrumb-clicked(idx); }
+                            }
+                        }
+                    }
+                }
+
+                // Empty State
+                if !root.scanning
+                    && root.continue-watching.length == 0
+                    && root.direct-video-rows.length == 0
+                    && root.shelves.length == 0 : Rectangle {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+
+                        Image {
+                            source: @image-url("../../assets/icons/film.svg");
+                            width: 36px;
+                            height: 36px;
+                            x: (parent.width - self.width) / 2;
+                            colorize: Theme.icon-disabled;
+                        }
+
+                        Text {
+                            text: root.search-query != "" ? "No matching videos found" : "No videos in this folder";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.text-primary;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: root.search-query != "" ? "Try clearing the search filter" : "Open a file or choose another folder from the sidebar";
+                            font-size: 12px;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                // Virtualized ListView for 1,000+ direct videos (ContinueWatching / Recent / leaf Folder)
+                if root.direct-video-rows.length > 0
+                    && root.shelves.length == 0
+                    && !(root.active-nav-kind == PickerNavKind.Home && root.continue-watching.length > 0) : ListView {
+                    vertical-stretch: 1;
+
+                    for grid-row in root.direct-video-rows : Rectangle {
+                        height: main-pane.dynamic-card-width * 9 / 16 + 70px;
+                        background: transparent;
+
+                        HorizontalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: 100%;
+                            spacing: 16px;
+                            alignment: start;
+
+                            for item in grid-row.items : VideoCard {
+                                entry: item;
+                                card-width: main-pane.dynamic-card-width;
+                                clicked(path, resume) => { root.video-clicked(path, resume); }
+                                request-thumbnail(id, path) => { root.request-thumbnail(id, path); }
+                                context-menu-requested(e, cx, cy) => {
+                                    root.context-entry = e;
+                                    root.context-x = cx;
+                                    root.context-y = cy;
+                                    root.context-menu-open = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Mixed Home / Subfolder Shelves View (Continue Watching + Direct Grid + Subcategory Shelves)
+                if root.shelves.length > 0
+                    || (root.active-nav-kind == PickerNavKind.Home && root.continue-watching.length > 0) : Flickable {
+                    vertical-stretch: 1;
+                    content-width: self.width;
+                    content-height: mixed-col.preferred-height;
+
+                    mixed-col := VerticalLayout {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        spacing: 20px;
+                        alignment: start;
+
+                        // Continue Watching Shelf (Home mode)
+                        if root.active-nav-kind == PickerNavKind.Home && root.continue-watching.length > 0 : ShelfRow {
+                            section: {
+                                folder-path: "",
+                                title: "Continue Watching",
+                                total-count: root.continue-watching.length,
+                                items: root.continue-watching,
+                            };
+                            show-see-all: false;
+                            card-width: main-pane.dynamic-card-width;
+                            video-clicked(path, resume) => { root.video-clicked(path, resume); }
+                            request-thumbnail(id, path) => { root.request-thumbnail(id, path); }
+                            context-menu-requested(e, cx, cy) => {
+                                root.context-entry = e;
+                                root.context-x = cx;
+                                root.context-y = cy;
+                                root.context-menu-open = true;
+                            }
+                        }
+
+                        // Direct Videos in Current Folder
+                        for grid-row in root.direct-video-rows : Rectangle {
+                            height: main-pane.dynamic-card-width * 9 / 16 + 70px;
+                            background: transparent;
+
+                            HorizontalLayout {
+                                x: 0px;
+                                y: 0px;
+                                width: 100%;
+                                spacing: 16px;
+                                alignment: start;
+
+                                for item in grid-row.items : VideoCard {
+                                    entry: item;
+                                    card-width: main-pane.dynamic-card-width;
+                                    clicked(path, resume) => { root.video-clicked(path, resume); }
+                                    request-thumbnail(id, path) => { root.request-thumbnail(id, path); }
+                                    context-menu-requested(e, cx, cy) => {
+                                        root.context-entry = e;
+                                        root.context-x = cx;
+                                        root.context-y = cy;
+                                        root.context-menu-open = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Subcategory Shelves
+                        for shelf in root.shelves : ShelfRow {
+                            section: shelf;
+                            show-see-all: true;
+                            card-width: main-pane.dynamic-card-width;
+                            see-all-clicked(fp) => { root.nav-selected(PickerNavKind.Folder, fp); }
+                            video-clicked(path, resume) => { root.video-clicked(path, resume); }
+                            request-thumbnail(id, path) => { root.request-thumbnail(id, path); }
+                            context-menu-requested(e, cx, cy) => {
+                                root.context-entry = e;
+                                root.context-x = cx;
+                                root.context-y = cy;
+                                root.context-menu-open = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Context Menu Backdrop & Popover
+    if root.context-menu-open : TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.context-menu-open = false; }
+    }
+
+    if root.context-menu-open : Rectangle {
+        x: clamp(root.context-x, 12px, root.width - self.width - 12px);
+        y: clamp(root.context-y, Theme.top-bar-content-height + 8px, root.height - self.height - 12px);
+        width: 200px;
+        height: 118px;
+        border-radius: Theme.popover-radius;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 2px;
+
+            // Play from beginning
+            Rectangle {
+                height: 34px;
+                border-radius: 6px;
+                background: ctx-play-touch.has-hover ? Theme.popover-item-hover : transparent;
+                Text {
+                    x: 10px;
+                    text: "Play from beginning";
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+                ctx-play-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.context-menu-open = false;
+                        root.video-clicked(root.context-entry.path, false);
+                    }
+                }
+            }
+
+            // Mark as watched / Reset progress
+            Rectangle {
+                height: 34px;
+                border-radius: 6px;
+                background: ctx-watch-touch.has-hover ? Theme.popover-item-hover : transparent;
+                Text {
+                    x: 10px;
+                    text: root.context-entry.watched ? "Reset watch progress" : "Mark as watched";
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+                ctx-watch-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.context-menu-open = false;
+                        root.mark-watched(root.context-entry.path, !root.context-entry.watched);
+                    }
+                }
+            }
+
+            // Reveal in file manager
+            Rectangle {
+                height: 34px;
+                border-radius: 6px;
+                background: ctx-reveal-touch.has-hover ? Theme.popover-item-hover : transparent;
+                Text {
+                    x: 10px;
+                    text: "Reveal in file manager";
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+                ctx-reveal-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.context-menu-open = false;
+                        root.reveal-in-file-manager(root.context-entry.path);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -37,6 +37,59 @@ export struct ChapterItem {
     current: bool,
 }
 
+export enum AppViewMode {
+    Picker,
+    Player,
+}
+
+export enum PickerNavKind {
+    Home,
+    ContinueWatching,
+    Recent,
+    Folder,
+}
+
+export enum PickerSortMode {
+    Name,
+    Recent,
+    Progress,
+}
+
+export struct VideoEntry {
+    id: string,
+    path: string,
+    title: string,
+    subtitle: string,
+    duration-text: string,
+    duration-sec: float,
+    position-sec: float,
+    progress: float,
+    watched: bool,
+    thumbnail: image,
+    has-thumbnail: bool,
+}
+
+export struct FolderNode {
+    path: string,
+    name: string,
+    depth: int,
+    has-children: bool,
+    expanded: bool,
+    selected: bool,
+}
+
+export struct ShelfSection {
+    folder-path: string,
+    title: string,
+    total-count: int,
+    items: [VideoEntry],
+}
+
+export struct VideoGridRow {
+    row-index: int,
+    items: [VideoEntry],
+}
+
 export global Theme {
     // --- Color & Gradient Tokens ---
     out property <color> canvas-bg: #000000;
@@ -77,4 +130,19 @@ export global Theme {
     out property <length> icon-btn-radius: 17px;
     out property <length> icon-glyph-size: 18px;
     out property <length> popover-radius: 10px;
+
+    // --- Video Picker Tokens ---
+    out property <color> picker-bg: #090a0f;
+    out property <color> sidebar-bg: #12141ae6;
+    out property <color> sidebar-border: #ffffff1f;
+    out property <length> sidebar-radius: 12px;
+    out property <length> sidebar-width: 240px;
+
+    out property <color> card-bg: #0f1117;
+    out property <color> card-border: #ffffff14;
+    out property <color> card-border-hover: #ffffff40;
+    out property <length> card-radius: 10px;
+    out property <color> progress-track: #ffffff38;
+    out property <color> progress-fill: #818cf8;
+    out property <color> pill-bg: #000000b3;
 }

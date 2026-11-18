@@ -1,12 +1,18 @@
-import { Theme, ActivePopover } from "../theme.slint";
+import { Theme, ActivePopover, AppViewMode, PickerSortMode } from "../theme.slint";
 import { IconButton } from "icon-button.slint";
 
 export component TopBar inherits Rectangle {
     in property <string> media-title: "";
     in property <bool> is-maximized: false;
     in property <bool> is-fullscreen: false;
+    in property <AppViewMode> view-mode: AppViewMode.Player;
+    in property <bool> sidebar-open: true;
+    in property <bool> has-video: false;
+    in-out property <string> picker-search-query: "";
+    in-out property <PickerSortMode> picker-sort-mode: PickerSortMode.Name;
     in-out property <ActivePopover> active-popover: ActivePopover.None;
 
+    out property <bool> search-focused: search-input.has-focus;
     out property <bool> has-hover: bar-touch.has-hover
                                 || open-touch.has-hover
                                 || drag-touch.has-hover
@@ -20,6 +26,15 @@ export component TopBar inherits Rectangle {
     callback close-clicked();
     callback window-drag-requested(float, float);
     callback pointer-activity();
+    callback toggle-sidebar-clicked();
+    callback return-to-picker-clicked();
+    callback return-to-player-clicked();
+    callback picker-search-changed(string);
+    callback picker-sort-changed(PickerSortMode);
+
+    public function focus-search() {
+        search-input.focus();
+    }
 
     height: Theme.top-gradient-height;
     background: Theme.hud-gradient-top;
@@ -43,12 +58,65 @@ export component TopBar inherits Rectangle {
         padding-right: 16px;
         spacing: 12px;
 
-        // Left: Open Menu Pill Button
+        // Left: Picker Sidebar Toggle / Player Library + Open Menu
+        if root.view-mode == AppViewMode.Picker : HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: @image-url("../assets/icons/panel-left.svg");
+                tooltip: "Toggle Sidebar (Ctrl+B)";
+                active: root.sidebar-open;
+                clicked => {
+                    root.pointer-activity();
+                    root.toggle-sidebar-clicked();
+                }
+            }
+
+            if root.has-video : Rectangle {
+                width: resume-pill-txt.preferred-width + 20px;
+                height: 30px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 15px;
+                background: resume-pill-touch.has-hover ? Theme.btn-circle-hover : Theme.popover-item-active;
+                border-width: 1px;
+                border-color: Theme.sidebar-border;
+                animate background { duration: 150ms; easing: ease-out; }
+
+                resume-pill-txt := Text {
+                    text: "Now Playing ›";
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                resume-pill-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.return-to-player-clicked(); }
+                }
+            }
+        }
+
+        if root.view-mode == AppViewMode.Player : IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: @image-url("../assets/icons/layout-grid.svg");
+            tooltip: "Return to Library (Esc)";
+            clicked => {
+                root.pointer-activity();
+                root.return-to-picker-clicked();
+            }
+        }
+
         Rectangle {
-            width: 62px;
+            visible: root.view-mode == AppViewMode.Player;
+            width: root.view-mode == AppViewMode.Player ? 62px : 0px;
             height: 34px;
             y: (parent.height - self.height) / 2;
             border-radius: 17px;
+            clip: true;
             background: open-touch.pressed ? Theme.btn-circle-pressed
                       : open-touch.has-hover ? Theme.btn-circle-hover
                       : (root.active-popover == ActivePopover.OpenMenu || root.active-popover == ActivePopover.OpenUrlModal) ? Theme.btn-circle-active
@@ -82,6 +150,7 @@ export component TopBar inherits Rectangle {
             }
 
             open-touch := TouchArea {
+                enabled: root.view-mode == AppViewMode.Player;
                 mouse-cursor: MouseCursor.pointer;
                 clicked => {
                     root.pointer-activity();
@@ -94,12 +163,12 @@ export component TopBar inherits Rectangle {
             }
         }
 
-        // Center: Media Title & Window Drag Area
+        // Center: Media Title & Window Drag Area (+ Picker Search / Sort)
         Rectangle {
             horizontal-stretch: 1;
             height: 100%;
 
-            Text {
+            if root.view-mode == AppViewMode.Player : Text {
                 width: 100%;
                 height: 100%;
                 text: root.media-title != "" ? root.media-title : "mpvx";
@@ -109,6 +178,16 @@ export component TopBar inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 overflow: elide;
+            }
+
+            if root.view-mode == AppViewMode.Picker : Text {
+                x: 8px;
+                height: 100%;
+                text: "mpvx";
+                font-size: 14px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                vertical-alignment: center;
             }
 
             drag-touch := TouchArea {
@@ -128,6 +207,96 @@ export component TopBar inherits Rectangle {
                                 (self.mouse-x - self.pressed-x) / 1px,
                                 (self.mouse-y - self.pressed-y) / 1px
                             );
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                visible: root.view-mode == AppViewMode.Picker;
+                alignment: end;
+                spacing: 8px;
+                padding-right: 4px;
+
+                // Search Filter Box
+                Rectangle {
+                    width: 220px;
+                    height: 32px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 8px;
+                    background: #ffffff10;
+                    border-width: 1px;
+                    border-color: search-input.has-focus ? Theme.icon-accent : Theme.sidebar-border;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 6px;
+
+                        Image {
+                            source: @image-url("../assets/icons/search.svg");
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                            colorize: Theme.icon-muted;
+                        }
+
+                        search-input := TextInput {
+                            horizontal-stretch: 1;
+                            height: 100%;
+                            text <=> root.picker-search-query;
+                            font-size: 12px;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                            edited => {
+                                root.picker-search-changed(self.text);
+                            }
+                        }
+                    }
+
+                    if root.picker-search-query == "" : Text {
+                        x: 30px;
+                        height: 100%;
+                        text: "Search videos… (/)";
+                        font-size: 12px;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Sort Mode Cycle Pill
+                Rectangle {
+                    width: sort-label.preferred-width + 20px;
+                    height: 32px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 8px;
+                    background: sort-touch.has-hover ? Theme.btn-circle-hover : #ffffff10;
+                    border-width: 1px;
+                    border-color: Theme.sidebar-border;
+                    animate background { duration: 120ms; easing: ease-out; }
+
+                    sort-label := Text {
+                        text: root.picker-sort-mode == PickerSortMode.Name ? "Sort: Name"
+                            : root.picker-sort-mode == PickerSortMode.Recent ? "Sort: Recent"
+                            : "Sort: Progress";
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    sort-touch := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => {
+                            if (root.picker-sort-mode == PickerSortMode.Name) {
+                                root.picker-sort-mode = PickerSortMode.Recent;
+                            } else if (root.picker-sort-mode == PickerSortMode.Recent) {
+                                root.picker-sort-mode = PickerSortMode.Progress;
+                            } else {
+                                root.picker-sort-mode = PickerSortMode.Name;
+                            }
+                            root.picker-sort-changed(root.picker-sort-mode);
                         }
                     }
                 }

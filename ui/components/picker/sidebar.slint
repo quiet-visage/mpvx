@@ -1,0 +1,255 @@
+import { ListView } from "std-widgets.slint";
+import { Theme, PickerNavKind, FolderNode } from "../../theme.slint";
+
+component SidebarNavRow inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected: false;
+
+    callback clicked();
+
+    height: 34px;
+    border-radius: 8px;
+    background: root.selected ? Theme.popover-item-active
+              : row-touch.has-hover ? Theme.popover-item-hover
+              : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    if root.selected : Rectangle {
+        x: 0px;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: 16px;
+        border-radius: 1.5px;
+        background: Theme.icon-accent;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 10px;
+        alignment: start;
+
+        Image {
+            source: root.icon;
+            width: 16px;
+            height: 16px;
+            y: (parent.height - self.height) / 2;
+            colorize: root.selected ? Theme.icon-accent : Theme.icon-muted;
+        }
+
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 500;
+            color: root.selected ? Theme.text-primary : Theme.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    row-touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component PickerSidebar inherits Rectangle {
+    in property <bool> open: true;
+    in property <PickerNavKind> active-nav-kind: PickerNavKind.Home;
+    in property <[FolderNode]> folders: [];
+
+    callback nav-selected(PickerNavKind, string /* path */);
+    callback folder-toggled(string /* path */);
+    callback open-file-clicked();
+    callback open-folder-clicked();
+
+    width: root.open ? Theme.sidebar-width : 0px;
+    opacity: root.open ? 1.0 : 0.0;
+    clip: true;
+    border-radius: Theme.sidebar-radius;
+    background: Theme.sidebar-bg;
+    border-width: root.open ? 1px : 0px;
+    border-color: Theme.sidebar-border;
+
+    animate width { duration: 200ms; easing: ease-out; }
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    if root.open || root.width > 1px : VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+
+        // Pinned Views
+        SidebarNavRow {
+            label: "Home";
+            icon: @image-url("../../assets/icons/layout-grid.svg");
+            selected: root.active-nav-kind == PickerNavKind.Home;
+            clicked => { root.nav-selected(PickerNavKind.Home, ""); }
+        }
+
+        SidebarNavRow {
+            label: "Continue Watching";
+            icon: @image-url("../../assets/icons/play.svg");
+            selected: root.active-nav-kind == PickerNavKind.ContinueWatching;
+            clicked => { root.nav-selected(PickerNavKind.ContinueWatching, ""); }
+        }
+
+        SidebarNavRow {
+            label: "Recent";
+            icon: @image-url("../../assets/icons/clock.svg");
+            selected: root.active-nav-kind == PickerNavKind.Recent;
+            clicked => { root.nav-selected(PickerNavKind.Recent, ""); }
+        }
+
+        // Divider
+        Rectangle {
+            height: 1px;
+            background: Theme.sidebar-border;
+        }
+
+        // Section Label
+        Text {
+            text: "FOLDERS";
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.8px;
+            color: Theme.text-muted;
+            height: 20px;
+            vertical-alignment: center;
+        }
+
+        // Depth-2 Folder Tree (Virtualized ListView)
+        ListView {
+            vertical-stretch: 1;
+
+            for node in root.folders : Rectangle {
+                height: 32px;
+                border-radius: 7px;
+                background: node.selected ? Theme.popover-item-active
+                          : node-touch.has-hover ? Theme.popover-item-hover
+                          : transparent;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                if node.selected : Rectangle {
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                    width: 3px;
+                    height: 16px;
+                    border-radius: 1.5px;
+                    background: Theme.icon-accent;
+                }
+
+                HorizontalLayout {
+                    padding-left: node.depth > 1 ? 24px : 8px;
+                    padding-right: 8px;
+                    spacing: 6px;
+                    alignment: start;
+
+                    // Expand/collapse chevron for depth-1 nodes with children
+                    Rectangle {
+                        width: 18px;
+                        height: 24px;
+                        y: (parent.height - self.height) / 2;
+                        background: transparent;
+
+                        if node.has-children : Image {
+                            source: node.expanded
+                                ? @image-url("../../assets/icons/chevron-down.svg")
+                                : @image-url("../../assets/icons/chevron-right.svg");
+                            width: 13px;
+                            height: 13px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            colorize: Theme.icon-muted;
+                        }
+
+                        if node.has-children : TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.folder-toggled(node.path); }
+                        }
+                    }
+
+                    Image {
+                        source: @image-url("../../assets/icons/folder.svg");
+                        width: 15px;
+                        height: 15px;
+                        y: (parent.height - self.height) / 2;
+                        colorize: node.selected ? Theme.icon-accent : Theme.icon-muted;
+                    }
+
+                    Text {
+                        text: node.name;
+                        font-size: 13px;
+                        font-weight: node.selected ? 600 : 400;
+                        color: node.selected ? Theme.text-primary : Theme.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                node-touch := TouchArea {
+                    x: 26px;
+                    width: parent.width - 26px;
+                    height: parent.height;
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.nav-selected(PickerNavKind.Folder, node.path); }
+                }
+            }
+        }
+
+        // Footer Divider
+        Rectangle {
+            height: 1px;
+            background: Theme.sidebar-border;
+        }
+
+        // Footer Actions: Open File... / Open Folder...
+        HorizontalLayout {
+            spacing: 6px;
+            height: 32px;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 7px;
+                background: open-file-touch.has-hover ? Theme.popover-item-hover : #ffffff0a;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                Text {
+                    text: "Open File…";
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                open-file-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.open-file-clicked(); }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 7px;
+                background: open-dir-touch.has-hover ? Theme.popover-item-hover : #ffffff0a;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                Text {
+                    text: "Open Folder…";
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                open-dir-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.open-folder-clicked(); }
+                }
+            }
+        }
+    }
+}
