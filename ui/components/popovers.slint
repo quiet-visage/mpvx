@@ -1,0 +1,634 @@
+import { Theme, ActivePopover, TrackItem, ChapterItem } from "../theme.slint";
+
+component PopoverMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <string> sublabel: "";
+    in property <bool> selected: false;
+    in property <bool> has-icon: false;
+    in property <image> icon;
+
+    callback clicked();
+
+    height: 32px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.popover-item-hover
+              : root.selected ? Theme.popover-item-active
+              : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.label;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            if root.has-icon : Image {
+                source: root.icon;
+                width: 15px;
+                height: 15px;
+                y: (parent.height - self.height) / 2;
+                colorize: root.selected ? Theme.icon-accent : Theme.icon-primary;
+            }
+
+            if !root.has-icon : Rectangle {
+                width: 15px;
+                height: 15px;
+                y: (parent.height - self.height) / 2;
+
+                if root.selected : Image {
+                    source: @image-url("../assets/icons/check.svg");
+                    width: 15px;
+                    height: 15px;
+                    colorize: Theme.icon-accent;
+                }
+            }
+
+            Text {
+                text: root.label;
+                font-size: 12px;
+                font-weight: root.selected ? 600 : 400;
+                color: root.selected ? Theme.text-primary : Theme.text-secondary;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        if root.sublabel != "" : Text {
+            text: root.sublabel;
+            font-size: 11px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component SettingsPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    callback clicked();
+
+    height: 26px;
+    border-radius: 6px;
+    background: root.selected ? Theme.popover-item-active
+              : touch.has-hover ? Theme.popover-item-hover
+              : #ffffff0a;
+    border-width: 1px;
+    border-color: root.selected ? Theme.icon-accent : transparent;
+    animate background, border-color { duration: 120ms; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.text;
+
+    Text {
+        text: root.text;
+        font-size: 11px;
+        font-weight: root.selected ? 600 : 500;
+        color: root.selected ? Theme.text-primary : Theme.text-secondary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component PopoverLayer inherits Rectangle {
+    in-out property <ActivePopover> active-popover: ActivePopover.None;
+    in property <[TrackItem]> subtitle-tracks: [];
+    in property <[TrackItem]> audio-tracks: [];
+    in property <[ChapterItem]> chapters: [];
+    in property <bool> has-subtitles-enabled: false;
+    in-out property <float> playback-speed: 1.0;
+    in-out property <string> hwdec-mode: "auto-safe";
+    in-out property <string> aspect-ratio: "auto";
+    in property <string> media-title: "";
+    in property <string> url-draft: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+
+    property <float> open-progress: root.active-popover != ActivePopover.None ? 1.0 : 0.0;
+    animate open-progress { duration: 150ms; easing: ease-out; }
+
+    callback open-file-clicked();
+    callback open-url-submitted(string);
+    callback subtitle-track-selected(int);
+    callback load-external-subtitle-clicked();
+    callback audio-track-selected(int);
+    callback chapter-selected(int);
+    callback speed-changed(float);
+    callback hwdec-changed(string);
+    callback aspect-changed(string);
+
+    background: transparent;
+
+    // 1. Top-Left Open Menu Popover
+    if root.active-popover == ActivePopover.OpenMenu : Rectangle {
+        x: 16px;
+        y: 54px - (1.0 - root.open-progress) * 6px;
+        width: 240px;
+        height: 116px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+
+        TouchArea {} // Stop backdrop click propagation
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 4px;
+
+            PopoverMenuItem {
+                label: "Open Local File…";
+                has-icon: true;
+                icon: @image-url("../assets/icons/folder-open.svg");
+                clicked => {
+                    root.active-popover = ActivePopover.None;
+                    root.open-file-clicked();
+                }
+            }
+
+            PopoverMenuItem {
+                label: "Open Path / URL…";
+                has-icon: true;
+                icon: @image-url("../assets/icons/link.svg");
+                clicked => {
+                    root.active-popover = ActivePopover.OpenUrlModal;
+                }
+            }
+
+            PopoverMenuItem {
+                label: "Play Big Buck Bunny Sample";
+                has-icon: true;
+                icon: @image-url("../assets/icons/play.svg");
+                clicked => {
+                    root.active-popover = ActivePopover.None;
+                    root.open-url-submitted("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4");
+                }
+            }
+        }
+    }
+
+    // 2. Centered Open Path / URL Modal
+    if root.active-popover == ActivePopover.OpenUrlModal : Rectangle {
+        width: 440px;
+        height: 184px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 + (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+
+        TouchArea {} // Stop backdrop click propagation
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            Text {
+                text: "Open File Path or Stream URL";
+                font-size: 14px;
+                font-weight: 600;
+                color: Theme.text-primary;
+            }
+
+            Rectangle {
+                height: 36px;
+                border-radius: 6px;
+                background: #00000066;
+                border-width: 1px;
+                border-color: Theme.popover-border;
+
+                url-input := TextInput {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: 100%;
+                    text: root.url-draft;
+                    font-size: 12px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                    single-line: true;
+                    accepted => {
+                        root.active-popover = ActivePopover.None;
+                        root.open-url-submitted(self.text);
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: space-between;
+                height: 32px;
+
+                SettingsPill {
+                    width: 145px;
+                    height: 30px;
+                    text: "Use Sample Stream";
+                    clicked => {
+                        url-input.text = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    SettingsPill {
+                        width: 72px;
+                        height: 30px;
+                        text: "Cancel";
+                        clicked => {
+                            root.active-popover = ActivePopover.None;
+                        }
+                    }
+
+                    SettingsPill {
+                        width: 78px;
+                        height: 30px;
+                        text: "Play";
+                        selected: true;
+                        clicked => {
+                            root.active-popover = ActivePopover.None;
+                            root.open-url-submitted(url-input.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Subtitles Track Selector Popover
+    if root.active-popover == ActivePopover.Subtitles : Rectangle {
+        x: 140px;
+        width: 260px;
+        height: min(300px, 88px + root.subtitle-tracks.length * 34px);
+        y: parent.height - Theme.bottom-gradient-height - self.height + 12px + (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+        clip: true;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 2px;
+
+            Text {
+                text: "SUBTITLES";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            PopoverMenuItem {
+                label: "Off";
+                selected: !root.has-subtitles-enabled;
+                clicked => {
+                    root.subtitle-track-selected(-1);
+                    root.active-popover = ActivePopover.None;
+                }
+            }
+
+            for track in root.subtitle-tracks : PopoverMenuItem {
+                label: track.title;
+                sublabel: track.codec;
+                selected: track.selected;
+                clicked => {
+                    root.subtitle-track-selected(track.id);
+                    root.active-popover = ActivePopover.None;
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.popover-border;
+            }
+
+            PopoverMenuItem {
+                label: "Load External Subtitle…";
+                has-icon: true;
+                icon: @image-url("../assets/icons/folder-open.svg");
+                clicked => {
+                    root.active-popover = ActivePopover.None;
+                    root.load-external-subtitle-clicked();
+                }
+            }
+        }
+    }
+
+    // 4. Audio Track Selector Popover
+    if root.active-popover == ActivePopover.Audio : Rectangle {
+        x: 180px;
+        width: 260px;
+        height: min(280px, max(76px, 36px + root.audio-tracks.length * 34px));
+        y: parent.height - Theme.bottom-gradient-height - self.height + 12px + (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+        clip: true;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 2px;
+
+            Text {
+                text: "AUDIO TRACKS";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            if root.audio-tracks.length == 0 : Text {
+                text: "No audio tracks loaded";
+                font-size: 12px;
+                color: Theme.text-muted;
+                height: 32px;
+                vertical-alignment: center;
+            }
+
+            for track in root.audio-tracks : PopoverMenuItem {
+                label: track.title;
+                sublabel: track.codec;
+                selected: track.selected;
+                clicked => {
+                    root.audio-track-selected(track.id);
+                    root.active-popover = ActivePopover.None;
+                }
+            }
+        }
+    }
+
+    // 5. Chapters Drawer Popover
+    if root.active-popover == ActivePopover.Chapters : Rectangle {
+        width: 280px;
+        height: min(300px, max(76px, 36px + root.chapters.length * 34px));
+        x: max(16px, parent.width - self.width - 70px);
+        y: parent.height - Theme.bottom-gradient-height - self.height + 12px + (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+        clip: true;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 2px;
+
+            Text {
+                text: "CHAPTERS";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            if root.chapters.length == 0 : Text {
+                text: "No chapters in current media";
+                font-size: 12px;
+                color: Theme.text-muted;
+                height: 32px;
+                vertical-alignment: center;
+            }
+
+            for ch in root.chapters : PopoverMenuItem {
+                label: ch.title;
+                sublabel: ch.time-text;
+                selected: ch.current;
+                clicked => {
+                    root.chapter-selected(ch.index);
+                    root.active-popover = ActivePopover.None;
+                }
+            }
+        }
+    }
+
+    // 6. Quick Settings Popover (Speed, HWDEC, Aspect Ratio)
+    if root.active-popover == ActivePopover.Settings : Rectangle {
+        width: 300px;
+        height: 210px;
+        x: max(16px, parent.width - self.width - 36px);
+        y: parent.height - Theme.bottom-gradient-height - self.height + 12px + (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 10px;
+
+            // Playback Speed
+            Text {
+                text: "PLAYBACK SPEED";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+
+                for item in [
+                    { label: "0.5x", val: 0.5 },
+                    { label: "0.75x", val: 0.75 },
+                    { label: "1.0x", val: 1.0 },
+                    { label: "1.25x", val: 1.25 },
+                    { label: "1.5x", val: 1.5 },
+                    { label: "2.0x", val: 2.0 },
+                ] : SettingsPill {
+                    horizontal-stretch: 1;
+                    text: item.label;
+                    selected: abs(root.playback-speed - item.val) < 0.05;
+                    clicked => {
+                        root.playback-speed = item.val;
+                        root.speed-changed(item.val);
+                    }
+                }
+            }
+
+            // Hardware Decoding
+            Text {
+                text: "HARDWARE DECODING (HWDEC)";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+
+                for mode in ["auto-safe", "no", "vaapi", "nvdec"] : SettingsPill {
+                    horizontal-stretch: 1;
+                    text: mode;
+                    selected: root.hwdec-mode == mode;
+                    clicked => {
+                        root.hwdec-mode = mode;
+                        root.hwdec-changed(mode);
+                    }
+                }
+            }
+
+            // Aspect Ratio
+            Text {
+                text: "ASPECT RATIO";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+
+                for ratio in ["auto", "16:9", "4:3", "2.35:1"] : SettingsPill {
+                    horizontal-stretch: 1;
+                    text: ratio;
+                    selected: root.aspect-ratio == ratio;
+                    clicked => {
+                        root.aspect-ratio = ratio;
+                        root.aspect-changed(ratio);
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Top-Right Application Menu Popover (Media Info & Keyboard Shortcuts)
+    if root.active-popover == ActivePopover.AppMenu : Rectangle {
+        width: 280px;
+        height: 296px;
+        x: max(16px, parent.width - self.width - 16px);
+        y: 54px - (1.0 - root.open-progress) * 6px;
+        background: Theme.popover-bg;
+        border-width: 1px;
+        border-color: Theme.popover-border;
+        border-radius: Theme.popover-radius;
+        opacity: root.open-progress;
+
+        TouchArea {}
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+
+            Text {
+                text: "MEDIA INFO";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            Text {
+                text: root.media-title != "" ? root.media-title : "Idle — No media loaded";
+                font-size: 12px;
+                font-weight: 600;
+                color: root.media-title != "" ? Theme.text-primary : Theme.text-muted;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                height: 18px;
+                alignment: space-between;
+
+                Text {
+                    text: "Tracks";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.audio-tracks.length + " Audio · " + root.subtitle-tracks.length + " Sub";
+                    font-size: 11px;
+                    font-weight: 500;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                height: 18px;
+                alignment: space-between;
+
+                Text {
+                    text: "Decode / Aspect";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.hwdec-mode + " · " + root.aspect-ratio;
+                    font-size: 11px;
+                    font-weight: 500;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.popover-border;
+            }
+
+            Text {
+                text: "MPVX — KEYBOARD SHORTCUTS";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            for sc in [
+                { k: "Space / K", d: "Play / Pause" },
+                { k: "Left / Right", d: "Seek -5s / +5s" },
+                { k: "Up / Down", d: "Volume +5% / -5%" },
+                { k: "M", d: "Toggle Mute" },
+                { k: "L", d: "Cycle A/B Loop" },
+                { k: "C", d: "Cycle Subtitles" },
+                { k: "F / F11", d: "Toggle Fullscreen" },
+            ] : HorizontalLayout {
+                height: 20px;
+                alignment: space-between;
+
+                Text {
+                    text: sc.d;
+                    font-size: 11px;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: sc.k;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

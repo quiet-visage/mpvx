@@ -1,0 +1,71 @@
+import { Theme } from "../theme.slint";
+
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> enabled: true;
+    in property <bool> active: false;
+    in property <bool> accent: false;
+    in property <bool> muted: false;
+    in property <bool> accept-scroll: false;
+    in property <string> tooltip: "";
+    out property <bool> has-hover <=> touch.has-hover;
+
+    callback clicked();
+    callback right-clicked();
+    callback scrolled(float);
+
+    width: 34px;
+    height: 34px;
+    border-radius: 17px;
+
+    // Accessibility & testing metadata
+    accessible-role: button;
+    accessible-label: root.tooltip;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    background: !root.enabled ? Theme.btn-circle-idle
+              : touch.pressed ? Theme.btn-circle-pressed
+              : touch.has-hover ? Theme.btn-circle-hover
+              : root.active ? Theme.btn-circle-active
+              : Theme.btn-circle-idle;
+
+    animate background { duration: 150ms; easing: ease-in-out; }
+
+    Image {
+        source: root.icon;
+        width: 18px;
+        height: 18px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: !root.enabled ? Theme.icon-disabled
+                : root.accent ? Theme.icon-accent
+                : root.muted ? Theme.icon-muted
+                : Theme.icon-primary;
+        animate colorize { duration: 150ms; easing: ease-in-out; }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                root.right-clicked();
+            }
+        }
+        scroll-event(event) => {
+            if (root.accept-scroll && event.delta-y != 0px) {
+                root.scrolled(event.delta-y / 1px);
+                return accept;
+            }
+            return reject;
+        }
+    }
+}

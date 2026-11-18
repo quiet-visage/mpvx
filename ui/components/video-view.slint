@@ -1,0 +1,175 @@
+import { Theme } from "../theme.slint";
+
+export component VideoView inherits Rectangle {
+    in property <image> video-frame;
+    in property <bool> has-video: false;
+    in property <bool> is-playing: false;
+    in property <bool> is-buffering: false;
+    in property <bool> hud-visible: true;
+
+    callback single-clicked();
+    callback double-clicked();
+    callback open-clicked();
+    callback pointer-activity();
+
+    background: Theme.canvas-bg;
+    clip: true;
+
+    if root.has-video : Image {
+        width: 100%;
+        height: 100%;
+        source: root.video-frame;
+        image-fit: contain;
+    }
+
+    // Viewport interaction layer (pointer movement, single-click, double-click fullscreen)
+    viewport-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: (root.is-playing && !root.hud-visible) ? MouseCursor.none : MouseCursor.default;
+
+        clicked => {
+            root.pointer-activity();
+            root.single-clicked();
+        }
+
+        double-clicked => {
+            root.pointer-activity();
+            root.double-clicked();
+        }
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.pointer-activity();
+            }
+        }
+    }
+
+    // Minimalist monochrome idle placeholder when no video is active and not buffering
+    if !root.has-video && !root.is-buffering : Rectangle {
+        width: 240px;
+        height: 160px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: transparent;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 12px;
+
+            Rectangle {
+                width: 56px;
+                height: 56px;
+                x: (parent.width - self.width) / 2;
+                border-radius: 28px;
+                background: idle-open-touch.pressed ? Theme.btn-circle-pressed
+                          : idle-open-touch.has-hover ? Theme.btn-circle-hover
+                          : #ffffff12;
+                border-width: 1px;
+                border-color: Theme.popover-border;
+                animate background { duration: 150ms; easing: ease-in-out; }
+
+                Image {
+                    source: @image-url("../assets/icons/play.svg");
+                    width: 22px;
+                    height: 22px;
+                    x: (parent.width - self.width) / 2 + 1px;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.icon-primary;
+                }
+
+                idle-open-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.pointer-activity();
+                        root.open-clicked();
+                    }
+                }
+            }
+
+            Text {
+                text: "mpvx";
+                font-size: 16px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: "Click to open media or stream";
+                font-size: 12px;
+                color: Theme.text-muted;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    // Centered minimal arc loading spinner when opening or buffering media (no background card)
+    if root.is-buffering : Rectangle {
+        width: 44px;
+        height: 44px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+
+        accessible-role: progress-indicator;
+        accessible-label: "Buffering media";
+
+        // Subtle translucent ring track
+        Path {
+            width: 44px;
+            height: 44px;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 44;
+            viewbox-height: 44;
+            stroke: #ffffff26;
+            stroke-width: 3px;
+
+            MoveTo { x: 22; y: 4; }
+            ArcTo {
+                radius-x: 18;
+                radius-y: 18;
+                x: 22;
+                y: 40;
+                large-arc: true;
+                sweep: true;
+            }
+            ArcTo {
+                radius-x: 18;
+                radius-y: 18;
+                x: 22;
+                y: 4;
+                large-arc: true;
+                sweep: true;
+            }
+        }
+
+        // Smooth 60fps rotating white arc
+        Path {
+            property <angle> start-angle: 360deg * Math.mod(animation-tick() / 1ms, 750) / 750;
+            property <angle> end-angle: self.start-angle + 110deg;
+
+            width: 44px;
+            height: 44px;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 44;
+            viewbox-height: 44;
+            stroke: Theme.icon-primary;
+            stroke-width: 3px;
+
+            MoveTo {
+                x: 22 + 18 * Math.cos(parent.start-angle);
+                y: 22 + 18 * Math.sin(parent.start-angle);
+            }
+            ArcTo {
+                radius-x: 18;
+                radius-y: 18;
+                x: 22 + 18 * Math.cos(parent.end-angle);
+                y: 22 + 18 * Math.sin(parent.end-angle);
+                large-arc: false;
+                sweep: true;
+            }
+        }
+    }
+}

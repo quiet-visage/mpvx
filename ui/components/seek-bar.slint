@@ -1,0 +1,118 @@
+import { Theme, AbLoopState, ChapterItem } from "../theme.slint";
+
+export component SeekBar inherits Rectangle {
+    in property <float> progress: 0.0;           // 0.0 .. 1.0
+    in property <AbLoopState> ab-state: AbLoopState.Off;
+    in property <float> ab-a-norm: -1.0;         // 0.0 .. 1.0 (-1 if unset)
+    in property <float> ab-b-norm: -1.0;         // 0.0 .. 1.0 (-1 if unset)
+    in property <[ChapterItem]> chapters: [];
+
+    out property <bool> has-hover <=> seek-touch.has-hover;
+    out property <bool> is-scrubbing: false;
+    property <float> scrub-progress: 0.0;
+    property <float> display-progress: root.is-scrubbing ? root.scrub-progress : max(0.0, min(1.0, root.progress));
+
+    callback seek-requested(float);
+
+    height: 20px;
+    background: transparent;
+
+    accessible-role: slider;
+    accessible-label: "Seek Bar";
+    accessible-value: root.display-progress;
+    accessible-value-minimum: 0.0;
+    accessible-value-maximum: 1.0;
+
+    track-rect := Rectangle {
+        x: 0px;
+        width: parent.width;
+        height: (seek-touch.has-hover || root.is-scrubbing) ? 5px : 3px;
+        y: (parent.height - self.height) / 2;
+        background: Theme.seek-track;
+        border-radius: self.height / 2;
+        animate height { duration: 120ms; easing: ease-out; }
+
+        // A/B Loop Highlighted Range Fill
+        if root.ab-state == AbLoopState.Active && root.ab-a-norm >= 0.0 && root.ab-b-norm > root.ab-a-norm : Rectangle {
+            x: parent.width * max(0.0, min(1.0, root.ab-a-norm));
+            width: parent.width * max(0.0, min(1.0, root.ab-b-norm) - max(0.0, min(1.0, root.ab-a-norm)));
+            height: 100%;
+            background: Theme.seek-ab-fill;
+            border-radius: parent.border-radius;
+        }
+
+        // Played Progress Fill
+        Rectangle {
+            x: 0px;
+            width: parent.width * root.display-progress;
+            height: 100%;
+            background: Theme.seek-fill;
+            border-radius: parent.border-radius;
+        }
+
+        // Chapter Tick Marks
+        for ch in root.chapters : Rectangle {
+            x: parent.width * max(0.0, min(1.0, ch.norm-pos)) - 1px;
+            y: 0px;
+            width: 2px;
+            height: parent.height;
+            background: #00000099;
+        }
+    }
+
+    // A Marker
+    if root.ab-state != AbLoopState.Off && root.ab-a-norm >= 0.0 : Rectangle {
+        x: track-rect.width * max(0.0, min(1.0, root.ab-a-norm)) - 1px;
+        y: (parent.height - self.height) / 2;
+        width: 2px;
+        height: 9px;
+        border-radius: 1px;
+        background: Theme.icon-accent;
+    }
+
+    // B Marker
+    if root.ab-state == AbLoopState.Active && root.ab-a-norm >= 0.0 && root.ab-b-norm > root.ab-a-norm : Rectangle {
+        x: track-rect.width * max(0.0, min(1.0, root.ab-b-norm)) - 1px;
+        y: (parent.height - self.height) / 2;
+        width: 2px;
+        height: 9px;
+        border-radius: 1px;
+        background: Theme.icon-accent;
+    }
+
+    // Scrubber Thumb
+    thumb := Rectangle {
+        property <length> thumb-size: (seek-touch.has-hover || root.is-scrubbing) ? 14px : 12px;
+        width: self.thumb-size;
+        height: self.thumb-size;
+        border-radius: self.width / 2;
+        x: max(0px, min(parent.width - self.width, parent.width * root.display-progress - self.width / 2));
+        y: (parent.height - self.height) / 2;
+        background: Theme.seek-fill;
+        opacity: (seek-touch.has-hover || root.is-scrubbing) ? 1.0 : 0.0;
+        animate opacity, width, height { duration: 120ms; easing: ease-out; }
+    }
+
+    seek-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: MouseCursor.pointer;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.is-scrubbing = true;
+                root.scrub-progress = max(0.0, min(1.0, self.mouse-x / max(1px, self.width)));
+                root.seek-requested(root.scrub-progress);
+            } else if (event.kind == PointerEventKind.move && root.is-scrubbing) {
+                root.scrub-progress = max(0.0, min(1.0, self.mouse-x / max(1px, self.width)));
+                root.seek-requested(root.scrub-progress);
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                if (root.is-scrubbing) {
+                    root.scrub-progress = max(0.0, min(1.0, self.mouse-x / max(1px, self.width)));
+                    root.is-scrubbing = false;
+                    root.seek-requested(root.scrub-progress);
+                }
+            }
+        }
+    }
+}

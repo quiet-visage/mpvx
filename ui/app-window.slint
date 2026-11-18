@@ -1,0 +1,342 @@
+import { Theme, LoopMode, AbLoopState, ActivePopover, TrackItem, ChapterItem } from "theme.slint";
+import { VideoView } from "components/video-view.slint";
+import { TopBar } from "components/top-bar.slint";
+import { ControlsBar } from "components/controls.slint";
+import { PopoverLayer } from "components/popovers.slint";
+
+export { LoopMode, AbLoopState, ActivePopover, TrackItem, ChapterItem }
+
+export component MainWindow inherits Window {
+    no-frame: true;
+    title: root.media-title != "" ? root.media-title + " - mpvx" : "mpvx";
+    min-width: 640px;
+    min-height: 360px;
+    preferred-width: 1280px;
+    preferred-height: 720px;
+    default-font-family: "sans-serif";
+    background: transparent;
+    forward-focus: key-scope;
+
+    // --- Core Playback State ---
+    in property <image> video-frame;
+    in property <bool> has-video: false;
+    in property <bool> is-playing: false;
+    in property <bool> is-buffering: false;
+    in property <float> progress: 0.0;           // 0.0 .. 1.0
+    in property <string> time-text: "0:00 | 0:00";
+    in property <string> media-title: "";
+
+    // --- Audio & Volume ---
+    in property <float> volume: 100.0;           // 0.0 .. 100.0 (or 150.0 boost)
+    in property <bool> is-muted: false;
+
+    // --- Loop & A/B Loop ---
+    in-out property <LoopMode> loop-mode: LoopMode.Off;
+    in-out property <AbLoopState> ab-loop-state: AbLoopState.Off;
+    in property <float> ab-loop-a-norm: -1.0;    // Normalized 0..1 (-1 if unset)
+    in property <float> ab-loop-b-norm: -1.0;    // Normalized 0..1 (-1 if unset)
+
+    // --- Tracks, Chapters & Settings Models ---
+    in property <[TrackItem]> subtitle-tracks: [];
+    in property <[TrackItem]> audio-tracks: [];
+    in property <[ChapterItem]> chapters: [];
+    in-out property <bool> has-subtitles-enabled: false;
+    in-out property <int> active-subtitle-index: -1;
+    in-out property <float> playback-speed: 1.0;
+    in-out property <string> hwdec-mode: "auto-safe";
+    in-out property <string> aspect-ratio: "auto";
+
+    // --- Window & HUD State ---
+    in-out property <bool> is-fullscreen: false;
+    in-out property <bool> is-maximized: false;
+    in-out property <ActivePopover> active-popover: ActivePopover.None;
+    in-out property <bool> hud-visible: true;
+    in-out property <int> pointer-idle-ms: 0;
+
+    property <bool> hud-locked: !root.is-playing
+                             || !root.has-video
+                             || root.is-buffering
+                             || top-bar.has-hover
+                             || controls-bar.has-hover
+                             || controls-bar.is-scrubbing
+                             || root.active-popover != ActivePopover.None;
+
+    // --- Callbacks to C++ Backend ---
+    callback play-pause-clicked();
+    callback prev-clicked();
+    callback next-clicked();
+    callback stop-clicked();
+    callback seek-requested(float);              // Normalized 0.0 .. 1.0
+    callback relative-seek-requested(float);     // Relative seconds (e.g. -5.0, +5.0)
+    callback volume-changed(float);
+    callback mute-toggled();
+    callback ab-loop-cycled();
+    callback ab-loop-cleared();
+    callback loop-mode-cycled();
+    callback subtitle-track-selected(int);       // -1 for "Off" (sid=no)
+    callback load-external-subtitle-clicked();
+    callback audio-track-selected(int);
+    callback chapter-selected(int);
+    callback speed-changed(float);
+    callback hwdec-changed(string);
+    callback aspect-changed(string);
+    callback open-file-clicked();
+    callback open-url-submitted(string);
+    callback minimize-clicked();
+    callback maximize-toggled();
+    callback fullscreen-toggled();
+    callback close-clicked();
+    callback window-drag-requested(float, float); // delta-x, delta-y in logical px
+    callback viewport-resized(int, int);
+
+    function reset-hud-timer() {
+        root.pointer-idle-ms = 0;
+        root.hud-visible = true;
+    }
+
+    public function cycle-subtitles() {
+        if (root.subtitle-tracks.length <= 0) {
+            return;
+        }
+        if (!root.has-subtitles-enabled || root.active-subtitle-index < 0) {
+            root.active-subtitle-index = 0;
+            root.has-subtitles-enabled = true;
+            root.subtitle-track-selected(root.subtitle-tracks[0].id);
+        } else if (root.active-subtitle-index + 1 < root.subtitle-tracks.length) {
+            root.active-subtitle-index += 1;
+            root.has-subtitles-enabled = true;
+            root.subtitle-track-selected(root.subtitle-tracks[root.active-subtitle-index].id);
+        } else {
+            root.active-subtitle-index = -1;
+            root.has-subtitles-enabled = false;
+            root.subtitle-track-selected(-1);
+        }
+    }
+
+    changed active-popover => {
+        if (root.active-popover != ActivePopover.OpenUrlModal) {
+            key-scope.focus();
+        }
+    }
+
+    // HUD Auto-Hide Timer (250ms tick -> hide at 2500ms)
+    hud-timer := Timer {
+        interval: 250ms;
+        running: true;
+        triggered => {
+            if (root.hud-locked) {
+                root.pointer-idle-ms = 0;
+                root.hud-visible = true;
+            } else {
+                root.pointer-idle-ms += 250;
+                if (root.pointer-idle-ms >= 2500) {
+                    root.hud-visible = false;
+                }
+            }
+        }
+    }
+
+    // Rounded Frameless Window Shell (12px radius when windowed, 0px when maximized/fullscreen)
+    window-shell := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: Theme.canvas-bg;
+        border-radius: (root.is-fullscreen || root.is-maximized) ? 0px : Theme.window-radius;
+        clip: true;
+
+        changed width => {
+            root.viewport-resized(Math.round(self.width / 1px), Math.round(self.height / 1px));
+        }
+        changed height => {
+            root.viewport-resized(Math.round(self.width / 1px), Math.round(self.height / 1px));
+        }
+
+        // 1. Full-Bleed Video Canvas
+        video-view := VideoView {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            video-frame: root.video-frame;
+            has-video: root.has-video;
+            is-playing: root.is-playing;
+            is-buffering: root.is-buffering || (root.has-video && controls-bar.is-scrubbing);
+            hud-visible: root.hud-visible || root.hud-locked;
+
+            pointer-activity => { root.reset-hud-timer(); }
+            single-clicked => {
+                if (root.active-popover != ActivePopover.None) {
+                    root.active-popover = ActivePopover.None;
+                } else if (root.has-video) {
+                    root.play-pause-clicked();
+                }
+            }
+            double-clicked => { root.fullscreen-toggled(); }
+            open-clicked => { root.open-file-clicked(); }
+        }
+
+        // 2. Backdrop Dismissal Layer for Active Popovers
+        if root.active-popover != ActivePopover.None : TouchArea {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            clicked => {
+                root.reset-hud-timer();
+                root.active-popover = ActivePopover.None;
+            }
+        }
+
+        // 3. Top Gradient Overlay Bar (64px)
+        top-bar := TopBar {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            media-title: root.media-title;
+            is-maximized: root.is-maximized;
+            is-fullscreen: root.is-fullscreen;
+            active-popover <=> root.active-popover;
+            opacity: (root.hud-visible || root.hud-locked) ? 1.0 : 0.0;
+            animate opacity { duration: 220ms; easing: ease-out; }
+
+            pointer-activity => { root.reset-hud-timer(); }
+            minimize-clicked => { root.minimize-clicked(); }
+            maximize-toggled => { root.maximize-toggled(); }
+            close-clicked => { root.close-clicked(); }
+            window-drag-requested(dx, dy) => { root.window-drag-requested(dx, dy); }
+        }
+
+        // 4. Bottom Gradient Overlay Bar (104px)
+        controls-bar := ControlsBar {
+            x: 0px;
+            y: parent.height - self.height;
+            width: 100%;
+            is-playing: root.is-playing;
+            progress: root.progress;
+            time-text: root.time-text;
+            volume: root.volume;
+            is-muted: root.is-muted;
+            has-subtitles-enabled: root.has-subtitles-enabled;
+            loop-mode: root.loop-mode;
+            ab-loop-state: root.ab-loop-state;
+            ab-loop-a-norm: root.ab-loop-a-norm;
+            ab-loop-b-norm: root.ab-loop-b-norm;
+            chapters: root.chapters;
+            is-fullscreen: root.is-fullscreen;
+            active-popover <=> root.active-popover;
+            opacity: (root.hud-visible || root.hud-locked) ? 1.0 : 0.0;
+            animate opacity { duration: 220ms; easing: ease-out; }
+
+            pointer-activity => { root.reset-hud-timer(); }
+            prev-clicked => { root.prev-clicked(); }
+            play-pause-clicked => { root.play-pause-clicked(); }
+            next-clicked => { root.next-clicked(); }
+            mute-toggled => { root.mute-toggled(); }
+            volume-changed(v) => { root.volume-changed(v); }
+            ab-loop-cycled => { root.ab-loop-cycled(); }
+            ab-loop-cleared => { root.ab-loop-cleared(); }
+            loop-mode-cycled => { root.loop-mode-cycled(); }
+            fullscreen-toggled => { root.fullscreen-toggled(); }
+            seek-requested(pos) => { root.seek-requested(pos); }
+        }
+
+        // 5. Floating Glassmorphic Popovers
+        PopoverLayer {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            active-popover <=> root.active-popover;
+            subtitle-tracks: root.subtitle-tracks;
+            audio-tracks: root.audio-tracks;
+            chapters: root.chapters;
+            has-subtitles-enabled: root.has-subtitles-enabled;
+            playback-speed <=> root.playback-speed;
+            hwdec-mode <=> root.hwdec-mode;
+            aspect-ratio <=> root.aspect-ratio;
+            media-title: root.media-title;
+
+            open-file-clicked => { root.open-file-clicked(); }
+            open-url-submitted(url) => { root.open-url-submitted(url); }
+            subtitle-track-selected(id) => { root.subtitle-track-selected(id); }
+            load-external-subtitle-clicked => { root.load-external-subtitle-clicked(); }
+            audio-track-selected(id) => { root.audio-track-selected(id); }
+            chapter-selected(idx) => { root.chapter-selected(idx); }
+            speed-changed(s) => { root.speed-changed(s); }
+            hwdec-changed(m) => { root.hwdec-changed(m); }
+            aspect-changed(a) => { root.aspect-changed(a); }
+        }
+
+        // Subtle 1px outer border ring in windowed mode
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            border-radius: parent.border-radius;
+            border-width: (root.is-fullscreen || root.is-maximized) ? 0px : 1px;
+            border-color: Theme.window-border;
+        }
+    }
+
+    // 6. Keyboard Shortcuts Handler (when URL modal text input is not active)
+    key-scope := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: root.active-popover != ActivePopover.OpenUrlModal;
+
+        key-pressed(event) => {
+            root.reset-hud-timer();
+
+            if (event.text == " " || event.text == "k" || event.text == "K") {
+                root.play-pause-clicked();
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                root.relative-seek-requested(-5.0);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.relative-seek-requested(5.0);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.volume-changed(min(100.0, root.volume + 5.0));
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.volume-changed(max(0.0, root.volume - 5.0));
+                return accept;
+            }
+            if (event.text == "m" || event.text == "M") {
+                root.mute-toggled();
+                return accept;
+            }
+            if (event.text == "f" || event.text == "F" || event.text == Key.F11) {
+                root.fullscreen-toggled();
+                return accept;
+            }
+            if (event.text == "l" || event.text == "L") {
+                root.ab-loop-cycled();
+                return accept;
+            }
+            if (event.text == "c" || event.text == "C") {
+                root.cycle-subtitles();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.active-popover != ActivePopover.None) {
+                    root.active-popover = ActivePopover.None;
+                    return accept;
+                } else if (root.is-fullscreen) {
+                    root.fullscreen-toggled();
+                    return accept;
+                }
+            }
+            return reject;
+        }
+    }
+}

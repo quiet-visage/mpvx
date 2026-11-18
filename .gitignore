@@ -1,0 +1,66 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+bin/
+lib/
+
+# CMake artifacts (in-source fallback & user presets)
+CMakeUserPresets.json
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Local dependency & tool caches
+.deps/
+.cpm-cache/
+.cache/
+.task/
+
+# Compiled C++ outputs
+*.d
+*.o
+*.obj
+*.slo
+*.lo
+*.gch
+*.pch
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+*.lai
+*.la
+*.exe
+*.out
+*.app
+
+# Debug, Sanitizers, Profiling & Coverage
+core
+vgcore.*
+perf.data*
+*.profraw
+*.profdata
+*.gcov
+*.gcda
+*.gcno
+
+# Editor / IDE / OS artifacts
+.vscode/
+.idea/
+.vs/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store

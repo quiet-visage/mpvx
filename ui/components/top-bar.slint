@@ -1,0 +1,190 @@
+import { Theme, ActivePopover } from "../theme.slint";
+import { IconButton } from "icon-button.slint";
+
+export component TopBar inherits Rectangle {
+    in property <string> media-title: "";
+    in property <bool> is-maximized: false;
+    in property <bool> is-fullscreen: false;
+    in-out property <ActivePopover> active-popover: ActivePopover.None;
+
+    out property <bool> has-hover: bar-touch.has-hover
+                                || open-touch.has-hover
+                                || drag-touch.has-hover
+                                || menu-btn.has-hover
+                                || min-btn.has-hover
+                                || max-btn.has-hover
+                                || close-btn.has-hover;
+
+    callback minimize-clicked();
+    callback maximize-toggled();
+    callback close-clicked();
+    callback window-drag-requested(float, float);
+    callback pointer-activity();
+
+    height: Theme.top-gradient-height;
+    background: Theme.hud-gradient-top;
+
+    bar-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.pointer-activity();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: Theme.top-bar-content-height;
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+
+        // Left: Open Menu Pill Button
+        Rectangle {
+            width: 62px;
+            height: 34px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 17px;
+            background: open-touch.pressed ? Theme.btn-circle-pressed
+                      : open-touch.has-hover ? Theme.btn-circle-hover
+                      : (root.active-popover == ActivePopover.OpenMenu || root.active-popover == ActivePopover.OpenUrlModal) ? Theme.btn-circle-active
+                      : Theme.btn-circle-idle;
+            animate background { duration: 150ms; easing: ease-in-out; }
+
+            accessible-role: button;
+            accessible-label: "Open Media Menu";
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 4px;
+                padding-left: 10px;
+                padding-right: 8px;
+
+                Image {
+                    source: @image-url("../assets/icons/folder-open.svg");
+                    width: 18px;
+                    height: 18px;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.icon-primary;
+                }
+
+                Image {
+                    source: @image-url("../assets/icons/chevron-down.svg");
+                    width: 14px;
+                    height: 14px;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.icon-muted;
+                }
+            }
+
+            open-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.pointer-activity();
+                    if (root.active-popover == ActivePopover.OpenMenu) {
+                        root.active-popover = ActivePopover.None;
+                    } else {
+                        root.active-popover = ActivePopover.OpenMenu;
+                    }
+                }
+            }
+        }
+
+        // Center: Media Title & Window Drag Area
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+
+            Text {
+                width: 100%;
+                height: 100%;
+                text: root.media-title != "" ? root.media-title : "mpvx";
+                font-size: 13px;
+                font-weight: 500;
+                color: root.media-title != "" ? Theme.text-primary : Theme.text-muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            drag-touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                double-clicked => {
+                    root.pointer-activity();
+                    root.maximize-toggled();
+                }
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        root.pointer-activity();
+                    } else if (event.kind == PointerEventKind.move) {
+                        root.pointer-activity();
+                        if (self.pressed && !root.is-maximized && !root.is-fullscreen) {
+                            root.window-drag-requested(
+                                (self.mouse-x - self.pressed-x) / 1px,
+                                (self.mouse-y - self.pressed-y) / 1px
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Right: App Menu & Frameless Window Controls
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+
+            menu-btn := IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: @image-url("../assets/icons/menu.svg");
+                tooltip: "Application Menu";
+                active: root.active-popover == ActivePopover.AppMenu;
+                clicked => {
+                    root.pointer-activity();
+                    if (root.active-popover == ActivePopover.AppMenu) {
+                        root.active-popover = ActivePopover.None;
+                    } else {
+                        root.active-popover = ActivePopover.AppMenu;
+                    }
+                }
+            }
+
+            min-btn := IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: @image-url("../assets/icons/minus.svg");
+                tooltip: "Minimize";
+                clicked => {
+                    root.pointer-activity();
+                    root.minimize-clicked();
+                }
+            }
+
+            max-btn := IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: root.is-maximized
+                    ? @image-url("../assets/icons/copy.svg")
+                    : @image-url("../assets/icons/square.svg");
+                tooltip: root.is-maximized ? "Restore" : "Maximize";
+                clicked => {
+                    root.pointer-activity();
+                    root.maximize-toggled();
+                }
+            }
+
+            close-btn := IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: @image-url("../assets/icons/x.svg");
+                tooltip: "Close";
+                clicked => {
+                    root.pointer-activity();
+                    root.close-clicked();
+                }
+            }
+        }
+    }
+}

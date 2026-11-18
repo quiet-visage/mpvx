@@ -1,0 +1,80 @@
+export enum LoopMode {
+    Off,
+    File,
+    Playlist,
+}
+
+export enum AbLoopState {
+    Off,
+    SetA,
+    Active,
+}
+
+export enum ActivePopover {
+    None,
+    OpenMenu,
+    OpenUrlModal,
+    Subtitles,
+    Audio,
+    Chapters,
+    Settings,
+    AppMenu,
+}
+
+export struct TrackItem {
+    id: int,
+    title: string,
+    lang: string,
+    codec: string,
+    selected: bool,
+}
+
+export struct ChapterItem {
+    index: int,
+    title: string,
+    time-text: string,
+    norm-pos: float,
+    current: bool,
+}
+
+export global Theme {
+    // --- Color & Gradient Tokens ---
+    out property <color> canvas-bg: #000000;
+    out property <color> window-border: #ffffff1a;
+    out property <brush> hud-gradient-top: @linear-gradient(180deg, #000000bf 0%, #00000059 55%, #00000000 100%);
+    out property <brush> hud-gradient-bottom: @linear-gradient(0deg, #000000d9 0%, #00000073 55%, #00000000 100%);
+
+    out property <color> popover-bg: #12141ae6;
+    out property <color> popover-border: #ffffff1f;
+    out property <color> popover-item-hover: #ffffff14;
+    out property <color> popover-item-active: #818cf826;
+
+    out property <color> btn-circle-idle: #ffffff00;
+    out property <color> btn-circle-hover: #ffffff26;
+    out property <color> btn-circle-pressed: #ffffff40;
+    out property <color> btn-circle-active: #ffffff33;
+
+    out property <color> icon-primary: #ffffff;
+    out property <color> icon-muted: #ffffff99;
+    out property <color> icon-disabled: #ffffff40;
+    out property <color> icon-accent: #818cf8;
+
+    out property <color> text-primary: #f8fafc;
+    out property <color> text-secondary: #e2e8f0;
+    out property <color> text-muted: #94a3b8;
+
+    out property <color> seek-track: #ffffff38;
+    out property <color> seek-fill: #ffffff;
+    out property <color> seek-ab-fill: #818cf84d;
+
+    // --- Geometry Tokens ---
+    out property <length> window-radius: 12px;
+    out property <length> top-gradient-height: 64px;
+    out property <length> top-bar-content-height: 56px;
+    out property <length> bottom-gradient-height: 104px;
+    out property <length> bottom-bar-content-height: 96px;
+    out property <length> icon-btn-size: 34px;
+    out property <length> icon-btn-radius: 17px;
+    out property <length> icon-glyph-size: 18px;
+    out property <length> popover-radius: 10px;
+}

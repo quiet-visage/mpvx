@@ -1,0 +1,344 @@
+import { Theme, LoopMode, AbLoopState, ActivePopover, ChapterItem } from "../theme.slint";
+import { IconButton } from "icon-button.slint";
+import { SeekBar } from "seek-bar.slint";
+
+export component ControlsBar inherits Rectangle {
+    in property <bool> is-playing: false;
+    in property <float> progress: 0.0;
+    in property <string> time-text: "0:00 | 0:00";
+    in property <float> volume: 100.0;
+    in property <bool> is-muted: false;
+    in property <bool> has-subtitles-enabled: false;
+    in property <LoopMode> loop-mode: LoopMode.Off;
+    in property <AbLoopState> ab-loop-state: AbLoopState.Off;
+    in property <float> ab-loop-a-norm: -1.0;
+    in property <float> ab-loop-b-norm: -1.0;
+    in property <[ChapterItem]> chapters: [];
+    in property <bool> is-fullscreen: false;
+    in-out property <ActivePopover> active-popover: ActivePopover.None;
+
+    property <bool> is-dragging-volume: false;
+    property <bool> volume-drawer-open: vol-btn.has-hover || vol-touch.has-hover || root.is-dragging-volume;
+
+    out property <bool> is-scrubbing <=> seek-bar.is-scrubbing;
+    out property <bool> has-hover: bg-touch.has-hover
+                                || prev-btn.has-hover
+                                || play-btn.has-hover
+                                || next-btn.has-hover
+                                || vol-btn.has-hover
+                                || vol-touch.has-hover
+                                || sub-btn.has-hover
+                                || audio-btn.has-hover
+                                || ab-btn.has-hover
+                                || loop-btn.has-hover
+                                || chapters-btn.has-hover
+                                || settings-btn.has-hover
+                                || fs-btn.has-hover
+                                || seek-bar.has-hover
+                                || root.is-dragging-volume;
+
+    callback prev-clicked();
+    callback play-pause-clicked();
+    callback next-clicked();
+    callback mute-toggled();
+    callback volume-changed(float);
+    callback ab-loop-cycled();
+    callback ab-loop-cleared();
+    callback loop-mode-cycled();
+    callback fullscreen-toggled();
+    callback seek-requested(float);
+    callback pointer-activity();
+
+    height: Theme.bottom-gradient-height;
+    background: Theme.hud-gradient-bottom;
+
+    bg-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.pointer-activity();
+            }
+        }
+    }
+
+    VerticalLayout {
+        x: 0px;
+        y: parent.height - Theme.bottom-bar-content-height;
+        width: 100%;
+        height: Theme.bottom-bar-content-height;
+        padding-left: 18px;
+        padding-right: 18px;
+        padding-bottom: 14px;
+        padding-top: 12px;
+        spacing: 8px;
+        alignment: end;
+
+        // --- Row 1: Control Button Clusters ---
+        HorizontalLayout {
+            height: 34px;
+            alignment: space-between;
+
+            // Left Cluster
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+
+                prev-btn := IconButton {
+                    icon: @image-url("../assets/icons/skip-back.svg");
+                    tooltip: "Previous";
+                    clicked => {
+                        root.pointer-activity();
+                        root.prev-clicked();
+                    }
+                }
+
+                play-btn := IconButton {
+                    icon: root.is-playing
+                        ? @image-url("../assets/icons/pause.svg")
+                        : @image-url("../assets/icons/play.svg");
+                    tooltip: root.is-playing ? "Pause" : "Play";
+                    clicked => {
+                        root.pointer-activity();
+                        root.play-pause-clicked();
+                    }
+                }
+
+                next-btn := IconButton {
+                    icon: @image-url("../assets/icons/skip-forward.svg");
+                    tooltip: "Next";
+                    clicked => {
+                        root.pointer-activity();
+                        root.next-clicked();
+                    }
+                }
+
+                // Volume Button + Inline Expanding Volume Drawer
+                HorizontalLayout {
+                    spacing: 0px;
+
+                    vol-btn := IconButton {
+                        icon: (root.is-muted || root.volume <= 0.5)
+                            ? @image-url("../assets/icons/volume-x.svg")
+                            : (root.volume < 50.0)
+                                ? @image-url("../assets/icons/volume-1.svg")
+                                : @image-url("../assets/icons/volume-2.svg");
+                        tooltip: root.is-muted ? "Unmute" : "Mute";
+                        accept-scroll: true;
+                        clicked => {
+                            root.pointer-activity();
+                            root.mute-toggled();
+                        }
+                        scrolled(dy) => {
+                            root.pointer-activity();
+                            if (dy > 0) {
+                                root.volume-changed(min(150.0, root.volume + 5.0));
+                            } else if (dy < 0) {
+                                root.volume-changed(max(0.0, root.volume - 5.0));
+                            }
+                        }
+                    }
+
+                    // Inline Volume Drawer (0px -> 76px)
+                    Rectangle {
+                        width: root.volume-drawer-open ? 76px : 0px;
+                        height: 34px;
+                        clip: true;
+                        animate width { duration: 150ms; easing: ease-out; }
+
+                        Rectangle {
+                            x: 6px;
+                            width: 64px;
+                            height: 4px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 2px;
+                            background: Theme.seek-track;
+
+                            // Volume Fill
+                            Rectangle {
+                                x: 0px;
+                                width: parent.width * (root.is-muted ? 0.0 : max(0.0, min(1.0, root.volume / 100.0)));
+                                height: 100%;
+                                border-radius: 2px;
+                                background: Theme.seek-fill;
+                            }
+
+                            // Volume Thumb
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                x: max(0px, min(parent.width - self.width, parent.width * (root.is-muted ? 0.0 : max(0.0, min(1.0, root.volume / 100.0))) - self.width / 2));
+                                y: (parent.height - self.height) / 2;
+                                background: Theme.seek-fill;
+                            }
+                        }
+
+                        vol-touch := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            mouse-cursor: MouseCursor.pointer;
+
+                            pointer-event(event) => {
+                                root.pointer-activity();
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                    root.is-dragging-volume = true;
+                                    root.volume-changed(max(0.0, min(100.0, ((self.mouse-x - 6px) / 64px) * 100.0)));
+                                } else if (event.kind == PointerEventKind.move && root.is-dragging-volume) {
+                                    root.volume-changed(max(0.0, min(100.0, ((self.mouse-x - 6px) / 64px) * 100.0)));
+                                } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                                    root.is-dragging-volume = false;
+                                }
+                            }
+
+                            scroll-event(event) => {
+                                root.pointer-activity();
+                                if (event.delta-y > 0px) {
+                                    root.volume-changed(min(150.0, root.volume + 5.0));
+                                    return accept;
+                                } else if (event.delta-y < 0px) {
+                                    root.volume-changed(max(0.0, root.volume - 5.0));
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
+                    }
+                }
+
+                sub-btn := IconButton {
+                    icon: root.has-subtitles-enabled
+                        ? @image-url("../assets/icons/captions.svg")
+                        : @image-url("../assets/icons/captions-off.svg");
+                    tooltip: "Subtitles";
+                    active: root.active-popover == ActivePopover.Subtitles;
+                    muted: !root.has-subtitles-enabled && root.active-popover != ActivePopover.Subtitles;
+                    clicked => {
+                        root.pointer-activity();
+                        if (root.active-popover == ActivePopover.Subtitles) {
+                            root.active-popover = ActivePopover.None;
+                        } else {
+                            root.active-popover = ActivePopover.Subtitles;
+                        }
+                    }
+                }
+
+                audio-btn := IconButton {
+                    icon: @image-url("../assets/icons/audio-lines.svg");
+                    tooltip: "Audio Tracks";
+                    active: root.active-popover == ActivePopover.Audio;
+                    clicked => {
+                        root.pointer-activity();
+                        if (root.active-popover == ActivePopover.Audio) {
+                            root.active-popover = ActivePopover.None;
+                        } else {
+                            root.active-popover = ActivePopover.Audio;
+                        }
+                    }
+                }
+            }
+
+            // Right Cluster
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: end;
+
+                ab-btn := IconButton {
+                    icon: @image-url("../assets/icons/ab-loop.svg");
+                    tooltip: "A/B Loop";
+                    active: root.ab-loop-state != AbLoopState.Off;
+                    accent: root.ab-loop-state != AbLoopState.Off;
+                    clicked => {
+                        root.pointer-activity();
+                        root.ab-loop-cycled();
+                    }
+                    right-clicked => {
+                        root.pointer-activity();
+                        root.ab-loop-cleared();
+                    }
+                }
+
+                loop-btn := IconButton {
+                    icon: root.loop-mode == LoopMode.File
+                        ? @image-url("../assets/icons/repeat-1.svg")
+                        : @image-url("../assets/icons/repeat.svg");
+                    tooltip: "Loop Mode";
+                    active: root.loop-mode != LoopMode.Off;
+                    accent: root.loop-mode != LoopMode.Off;
+                    clicked => {
+                        root.pointer-activity();
+                        root.loop-mode-cycled();
+                    }
+                }
+
+                chapters-btn := IconButton {
+                    icon: @image-url("../assets/icons/list-video.svg");
+                    tooltip: "Chapters";
+                    active: root.active-popover == ActivePopover.Chapters;
+                    clicked => {
+                        root.pointer-activity();
+                        if (root.active-popover == ActivePopover.Chapters) {
+                            root.active-popover = ActivePopover.None;
+                        } else {
+                            root.active-popover = ActivePopover.Chapters;
+                        }
+                    }
+                }
+
+                settings-btn := IconButton {
+                    icon: @image-url("../assets/icons/settings.svg");
+                    tooltip: "Settings";
+                    active: root.active-popover == ActivePopover.Settings;
+                    clicked => {
+                        root.pointer-activity();
+                        if (root.active-popover == ActivePopover.Settings) {
+                            root.active-popover = ActivePopover.None;
+                        } else {
+                            root.active-popover = ActivePopover.Settings;
+                        }
+                    }
+                }
+
+                fs-btn := IconButton {
+                    icon: root.is-fullscreen
+                        ? @image-url("../assets/icons/minimize-2.svg")
+                        : @image-url("../assets/icons/maximize-2.svg");
+                    tooltip: root.is-fullscreen ? "Exit Fullscreen" : "Fullscreen";
+                    clicked => {
+                        root.pointer-activity();
+                        root.fullscreen-toggled();
+                    }
+                }
+            }
+        }
+
+        // --- Row 2: Seek Bar & Tabular Time Readout ---
+        HorizontalLayout {
+            height: 20px;
+            spacing: 14px;
+            alignment: stretch;
+
+            seek-bar := SeekBar {
+                horizontal-stretch: 1;
+                progress: root.progress;
+                ab-state: root.ab-loop-state;
+                ab-a-norm: root.ab-loop-a-norm;
+                ab-b-norm: root.ab-loop-b-norm;
+                chapters: root.chapters;
+                seek-requested(pos) => {
+                    root.pointer-activity();
+                    root.seek-requested(pos);
+                }
+            }
+
+            Text {
+                text: root.time-text;
+                font-size: 12px;
+                font-weight: 500;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+            }
+        }
+    }
+}

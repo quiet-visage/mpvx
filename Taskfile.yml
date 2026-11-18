@@ -1,0 +1,70 @@
+version: '3'
+
+vars:
+  PRESET: '{{.PRESET | default "dev-debug"}}'
+  BUILD_DIR: 'build/{{.PRESET}}'
+
+tasks:
+  default:
+    desc: Build mpvx (default task)
+    cmds:
+      - task: build
+
+  configure:
+    desc: Configure CMake build directory for the active preset (PRESET=dev-debug|dev-release|dev-sanitize)
+    status:
+      - test -f "{{.BUILD_DIR}}/Makefile"
+    cmds:
+      - cmake --preset "{{.PRESET}}"
+
+  build:
+    desc: Build mpvx and test binaries
+    deps: [configure]
+    cmds:
+      - cmake --build --preset "{{.PRESET}}" -j
+
+  build:release:
+    desc: Configure and build the optimized release preset (dev-release)
+    cmds:
+      - cmake --preset dev-release
+      - cmake --build --preset dev-release -j
+
+  build:sanitize:
+    desc: Configure and build with Address and Undefined Behavior Sanitizers (dev-sanitize)
+    cmds:
+      - cmake --preset dev-sanitize
+      - cmake --build --preset dev-sanitize -j
+
+  run:
+    desc: Build and run mpvx (pass media file/URL after --, e.g. `task run -- video.mp4`)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/mpvx {{.CLI_ARGS}}
+
+  test:
+    desc: Build and execute all Catch2 unit and headless Slint UI tests
+    deps: [build]
+    cmds:
+      - ctest --preset "{{.PRESET}}" --output-on-failure
+
+  format:
+    desc: Format all C++ source and header files with clang-format
+    deps: [configure]
+    cmds:
+      - cmake --build --preset "{{.PRESET}}" --target format
+
+  format:check:
+    desc: Verify C++ source formatting without modifying files
+    deps: [configure]
+    cmds:
+      - cmake --build --preset "{{.PRESET}}" --target format-check
+
+  clean:
+    desc: Clean the build directory for the current preset
+    cmds:
+      - rm -rf "{{.BUILD_DIR}}"
+
+  clean:all:
+    desc: Remove all CMake build directories
+    cmds:
+      - rm -rf build
