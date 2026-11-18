@@ -75,6 +75,10 @@ public:
     [[nodiscard]] Result<void> set_hwdec(std::string_view mode);
     [[nodiscard]] Result<void> set_aspect_override(std::string_view aspect);
 
+    // One-shot resume target applied automatically on MPV_EVENT_FILE_LOADED
+    void set_pending_resume(double seconds) noexcept;
+    void clear_pending_resume() noexcept;
+
     [[nodiscard]] double duration() const noexcept;
     [[nodiscard]] double time_pos() const noexcept;
     [[nodiscard]] double volume() const noexcept;
@@ -92,6 +96,7 @@ private:
     void observe_properties();
     void handle_mpv_event(void* event_ptr);
     void update_ab_loop_state_locked();
+    void update_playback_state(PlaybackState next_state, bool force_notify = false);
     void set_buffering_state(bool buffering);
     void recompute_buffering_state();
 
@@ -103,6 +108,9 @@ private:
     PlayerCallbacks callbacks_;
 
     std::atomic<PlaybackState> state_{PlaybackState::Idle};
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> file_loaded_{false};
+    std::atomic<bool> eof_reached_{false};
     std::atomic<double> duration_{0.0};
     std::atomic<double> time_pos_{0.0};
     std::atomic<double> volume_{100.0};
@@ -114,6 +122,8 @@ private:
     std::atomic<bool> paused_for_cache_{false};
     std::atomic<double> speed_{1.0};
     std::atomic<int> current_chapter_{-1};
+    std::atomic<int64_t> playlist_pos_{0};
+    std::atomic<double> pending_resume_sec_{-1.0};
     std::atomic<LoopMode> loop_mode_{LoopMode::Off};
     std::atomic<AbLoopState> ab_loop_state_{AbLoopState::Off};
 

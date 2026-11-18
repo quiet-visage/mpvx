@@ -122,6 +122,9 @@ Player& Player::operator=(Player&& other) noexcept {
             event_thread_ = std::move(other.event_thread_);
         }
         state_.store(other.state_.load());
+        paused_.store(other.paused_.load());
+        file_loaded_.store(other.file_loaded_.load());
+        eof_reached_.store(other.eof_reached_.load());
         duration_.store(other.duration_.load());
         time_pos_.store(other.time_pos_.load());
         volume_.store(other.volume_.load());
@@ -189,6 +192,7 @@ void Player::observe_properties() {
     mpv_observe_property(mpv_, 0, "time-pos", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv_, 0, "duration", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv_, 0, "pause", MPV_FORMAT_FLAG);
+    mpv_observe_property(mpv_, 0, "eof-reached", MPV_FORMAT_FLAG);
     mpv_observe_property(mpv_, 0, "volume", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv_, 0, "mute", MPV_FORMAT_FLAG);
     mpv_observe_property(mpv_, 0, "media-title", MPV_FORMAT_STRING);
@@ -204,6 +208,7 @@ void Player::observe_properties() {
     mpv_observe_property(mpv_, 0, "loop-file", MPV_FORMAT_NODE);
     mpv_observe_property(mpv_, 0, "loop-playlist", MPV_FORMAT_NODE);
     mpv_observe_property(mpv_, 0, "speed", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(mpv_, 0, "playlist-pos", MPV_FORMAT_INT64);
 }
 
 void Player::shutdown() {
@@ -228,10 +233,16 @@ Result<void> Player::load_file(std::string_view path) {
     }
 
     (void)clear_ab_loop();
+    file_loaded_.store(false, std::memory_order_release);
+    eof_reached_.store(false, std::memory_order_release);
+    paused_.store(false, std::memory_order_release);
     paused_for_cache_.store(false);
     seeking_.store(false);
     opening_.store(true);
     recompute_buffering_state();
+
+    int pause_val = 0;
+    (void)mpv_set_property_async(mpv_, 0, "pause", MPV_FORMAT_FLAG, &pause_val);
 
     std::string path_str(path);
     const char* cmd[] = {"loadfile", path_str.c_str(), "replace", nullptr};
@@ -246,6 +257,13 @@ Result<void> Player::load_file(std::string_view path) {
 
 Result<void> Player::play() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
+    if (file_loaded_.load(std::memory_order_acquire)
+        && eof_reached_.load(std::memory_order_acquire)
+        && paused_.load(std::memory_order_acquire)) {
+        eof_reached_.store(false, std::memory_order_release);
+        (void)seek(0.0, true);
+    }
+    paused_.store(false, std::memory_order_release);
     int pause_val = 0;
     int status = mpv_set_property_async(mpv_, 0, "pause", MPV_FORMAT_FLAG, &pause_val);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
@@ -254,6 +272,7 @@ Result<void> Player::play() {
 
 Result<void> Player::pause() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
+    paused_.store(true, std::memory_order_release);
     int pause_val = 1;
     int status = mpv_set_property_async(mpv_, 0, "pause", MPV_FORMAT_FLAG, &pause_val);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
@@ -262,18 +281,21 @@ Result<void> Player::pause() {
 
 Result<void> Player::toggle_pause() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
-    const char* cmd[] = {"cycle", "pause", nullptr};
-    int status = mpv_command_async(mpv_, 0, cmd);
-    if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
-    return {};
+    if (paused_.load(std::memory_order_acquire)) {
+        return play();
+    }
+    return pause();
 }
 
 Result<void> Player::stop() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
+    file_loaded_.store(false, std::memory_order_release);
+    eof_reached_.store(false, std::memory_order_release);
     opening_.store(false);
     seeking_.store(false);
     core_idle_.store(false);
     paused_for_cache_.store(false);
+    update_playback_state(PlaybackState::Idle);
     set_buffering_state(false);
     const char* cmd[] = {"stop", nullptr};
     int status = mpv_command_async(mpv_, 0, cmd);
@@ -318,11 +340,8 @@ Result<void> Player::seek_relative(double delta_seconds) {
 
 Result<void> Player::playlist_prev() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
-    int64_t playlist_pos = 0;
-    if (mpv_get_property(mpv_, "playlist-pos", MPV_FORMAT_INT64, &playlist_pos) < 0) {
-        playlist_pos = 0;
-    }
-    if (playlist_pos <= 0 || time_pos_.load() > 3.0) {
+    int64_t playlist_pos = playlist_pos_.load(std::memory_order_acquire);
+    if (playlist_pos <= 0 || time_pos_.load(std::memory_order_acquire) > 3.0) {
         return seek(0.0, true);
     }
     const char* cmd[] = {"playlist-prev", "weak", nullptr};
@@ -358,7 +377,8 @@ Result<void> Player::set_mute(bool muted) {
 Result<void> Player::set_subtitle_track(int sid) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
     std::string val = (sid <= 0) ? "no" : std::to_string(sid);
-    int status = mpv_set_property_string(mpv_, "sid", val.c_str());
+    const char* cstr = val.c_str();
+    int status = mpv_set_property_async(mpv_, 0, "sid", MPV_FORMAT_STRING, &cstr);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
     return {};
 }
@@ -375,7 +395,8 @@ Result<void> Player::add_subtitle_file(std::string_view path) {
 Result<void> Player::set_audio_track(int aid) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
     std::string val = (aid <= 0) ? "no" : std::to_string(aid);
-    int status = mpv_set_property_string(mpv_, "aid", val.c_str());
+    const char* cstr = val.c_str();
+    int status = mpv_set_property_async(mpv_, 0, "aid", MPV_FORMAT_STRING, &cstr);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
     return {};
 }
@@ -418,22 +439,20 @@ int Player::current_chapter() const noexcept {
 
 Result<void> Player::set_loop_mode(LoopMode mode) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
-    int s1 = 0;
-    int s2 = 0;
+    const char* loop_file_val = "no";
+    const char* loop_playlist_val = "no";
     switch (mode) {
         case LoopMode::Off:
-            s1 = mpv_set_property_string(mpv_, "loop-file", "no");
-            s2 = mpv_set_property_string(mpv_, "loop-playlist", "no");
             break;
         case LoopMode::File:
-            s1 = mpv_set_property_string(mpv_, "loop-file", "inf");
-            s2 = mpv_set_property_string(mpv_, "loop-playlist", "no");
+            loop_file_val = "inf";
             break;
         case LoopMode::Playlist:
-            s1 = mpv_set_property_string(mpv_, "loop-file", "no");
-            s2 = mpv_set_property_string(mpv_, "loop-playlist", "inf");
+            loop_playlist_val = "inf";
             break;
     }
+    int s1 = mpv_set_property_async(mpv_, 0, "loop-file", MPV_FORMAT_STRING, &loop_file_val);
+    int s2 = mpv_set_property_async(mpv_, 0, "loop-playlist", MPV_FORMAT_STRING, &loop_playlist_val);
     if (s1 < 0) return std::unexpected(PlayerError{s1, mpv_error_string(s1)});
     if (s2 < 0) return std::unexpected(PlayerError{s2, mpv_error_string(s2)});
 
@@ -470,8 +489,9 @@ Result<void> Player::cycle_ab_loop() {
     double now = std::max(0.0, time_pos_.load());
 
     if (current == AbLoopState::Off) {
-        int s1 = mpv_set_property(mpv_, "ab-loop-a", MPV_FORMAT_DOUBLE, &now);
-        int s2 = mpv_set_property_string(mpv_, "ab-loop-b", "no");
+        const char* no_str = "no";
+        int s1 = mpv_set_property_async(mpv_, 0, "ab-loop-a", MPV_FORMAT_DOUBLE, &now);
+        int s2 = mpv_set_property_async(mpv_, 0, "ab-loop-b", MPV_FORMAT_STRING, &no_str);
         if (s1 < 0) return std::unexpected(PlayerError{s1, mpv_error_string(s1)});
         if (s2 < 0) return std::unexpected(PlayerError{s2, mpv_error_string(s2)});
 
@@ -509,8 +529,8 @@ Result<void> Player::cycle_ab_loop() {
             new_b = (dur > new_a + 0.1) ? std::min(dur, new_a + 5.0) : (new_a + 5.0);
         }
 
-        int s1 = mpv_set_property(mpv_, "ab-loop-a", MPV_FORMAT_DOUBLE, &new_a);
-        int s2 = mpv_set_property(mpv_, "ab-loop-b", MPV_FORMAT_DOUBLE, &new_b);
+        int s1 = mpv_set_property_async(mpv_, 0, "ab-loop-a", MPV_FORMAT_DOUBLE, &new_a);
+        int s2 = mpv_set_property_async(mpv_, 0, "ab-loop-b", MPV_FORMAT_DOUBLE, &new_b);
         if (s1 < 0) return std::unexpected(PlayerError{s1, mpv_error_string(s1)});
         if (s2 < 0) return std::unexpected(PlayerError{s2, mpv_error_string(s2)});
 
@@ -537,8 +557,9 @@ Result<void> Player::cycle_ab_loop() {
 
 Result<void> Player::clear_ab_loop() {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
-    int s1 = mpv_set_property_string(mpv_, "ab-loop-a", "no");
-    int s2 = mpv_set_property_string(mpv_, "ab-loop-b", "no");
+    const char* no_str = "no";
+    int s1 = mpv_set_property_async(mpv_, 0, "ab-loop-a", MPV_FORMAT_STRING, &no_str);
+    int s2 = mpv_set_property_async(mpv_, 0, "ab-loop-b", MPV_FORMAT_STRING, &no_str);
     if (s1 < 0) return std::unexpected(PlayerError{s1, mpv_error_string(s1)});
     if (s2 < 0) return std::unexpected(PlayerError{s2, mpv_error_string(s2)});
 
@@ -577,7 +598,7 @@ std::optional<double> Player::ab_loop_b() const noexcept {
 Result<void> Player::set_speed(double speed) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
     double clamped = std::clamp(speed, 0.1, 4.0);
-    int status = mpv_set_property(mpv_, "speed", MPV_FORMAT_DOUBLE, &clamped);
+    int status = mpv_set_property_async(mpv_, 0, "speed", MPV_FORMAT_DOUBLE, &clamped);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
     speed_.store(clamped);
     std::function<void(double)> cb;
@@ -598,7 +619,8 @@ double Player::speed() const noexcept {
 Result<void> Player::set_hwdec(std::string_view mode) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
     std::string mode_str(mode.empty() ? "auto-safe" : mode);
-    int status = mpv_set_property_string(mpv_, "hwdec", mode_str.c_str());
+    const char* cstr = mode_str.c_str();
+    int status = mpv_set_property_async(mpv_, 0, "hwdec", MPV_FORMAT_STRING, &cstr);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
     return {};
 }
@@ -606,9 +628,18 @@ Result<void> Player::set_hwdec(std::string_view mode) {
 Result<void> Player::set_aspect_override(std::string_view aspect) {
     if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
     std::string val = (aspect.empty() || aspect == "auto") ? "-1" : std::string(aspect);
-    int status = mpv_set_property_string(mpv_, "video-aspect-override", val.c_str());
+    const char* cstr = val.c_str();
+    int status = mpv_set_property_async(mpv_, 0, "video-aspect-override", MPV_FORMAT_STRING, &cstr);
     if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
     return {};
+}
+
+void Player::set_pending_resume(double seconds) noexcept {
+    pending_resume_sec_.store(seconds, std::memory_order_release);
+}
+
+void Player::clear_pending_resume() noexcept {
+    pending_resume_sec_.store(-1.0, std::memory_order_release);
 }
 
 double Player::duration() const noexcept {
@@ -629,6 +660,22 @@ bool Player::is_muted() const noexcept {
 
 bool Player::is_buffering() const noexcept {
     return buffering_.load();
+}
+
+void Player::update_playback_state(PlaybackState next_state, bool force_notify) {
+    const PlaybackState prev = state_.exchange(next_state, std::memory_order_acq_rel);
+    recompute_buffering_state();
+    if (prev == next_state && !force_notify) {
+        return;
+    }
+    std::function<void(PlaybackState)> cb;
+    {
+        std::lock_guard lock(mutex_);
+        cb = callbacks_.on_state_changed;
+    }
+    if (cb) {
+        cb(next_state);
+    }
 }
 
 void Player::set_buffering_state(bool buffering) {
@@ -719,15 +766,15 @@ void Player::handle_mpv_event(void* event_ptr) {
             } else if (name == "pause") {
                 if (prop->format == MPV_FORMAT_FLAG && prop->data) {
                     bool is_paused = *static_cast<int*>(prop->data) != 0;
-                    PlaybackState new_state = is_paused ? PlaybackState::Paused : PlaybackState::Playing;
-                    state_.store(new_state);
-                    recompute_buffering_state();
-                    std::function<void(PlaybackState)> cb;
-                    {
-                        std::lock_guard lock(mutex_);
-                        cb = callbacks_.on_state_changed;
+                    paused_.store(is_paused, std::memory_order_release);
+                    if (file_loaded_.load(std::memory_order_acquire)) {
+                        update_playback_state(is_paused ? PlaybackState::Paused : PlaybackState::Playing);
                     }
-                    if (cb) cb(new_state);
+                }
+            } else if (name == "eof-reached") {
+                if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                    bool eof = *static_cast<int*>(prop->data) != 0;
+                    eof_reached_.store(eof, std::memory_order_release);
                 }
             } else if (name == "volume") {
                 if (prop->format == MPV_FORMAT_DOUBLE && prop->data) {
@@ -766,18 +813,14 @@ void Player::handle_mpv_event(void* event_ptr) {
                 if (prop->format == MPV_FORMAT_FLAG && prop->data) {
                     bool is_idle = *static_cast<int*>(prop->data) != 0;
                     if (is_idle) {
-                        state_.store(PlaybackState::Idle);
+                        file_loaded_.store(false, std::memory_order_release);
+                        eof_reached_.store(false, std::memory_order_release);
                         opening_.store(false);
                         seeking_.store(false);
                         core_idle_.store(false);
                         paused_for_cache_.store(false);
+                        update_playback_state(PlaybackState::Idle);
                         set_buffering_state(false);
-                        std::function<void(PlaybackState)> cb;
-                        {
-                            std::lock_guard lock(mutex_);
-                            cb = callbacks_.on_state_changed;
-                        }
-                        if (cb) cb(PlaybackState::Idle);
                     }
                 }
             } else if (name == "paused-for-cache") {
@@ -916,11 +959,17 @@ void Player::handle_mpv_event(void* event_ptr) {
                     }
                     if (cb) cb(s);
                 }
+            } else if (name == "playlist-pos") {
+                if (prop->format == MPV_FORMAT_INT64 && prop->data) {
+                    playlist_pos_.store(*static_cast<int64_t*>(prop->data), std::memory_order_release);
+                }
             }
             break;
         }
 
         case MPV_EVENT_START_FILE: {
+            file_loaded_.store(false, std::memory_order_release);
+            eof_reached_.store(false, std::memory_order_release);
             paused_for_cache_.store(false);
             seeking_.store(false);
             opening_.store(true);
@@ -929,18 +978,22 @@ void Player::handle_mpv_event(void* event_ptr) {
         }
 
         case MPV_EVENT_FILE_LOADED: {
-            state_.store(PlaybackState::Playing);
-            recompute_buffering_state();
-            std::function<void(PlaybackState)> state_cb;
+            const double resume_target = pending_resume_sec_.exchange(-1.0, std::memory_order_acq_rel);
+            if (resume_target > 0.0) {
+                (void)seek(resume_target, true);
+            }
+            file_loaded_.store(true, std::memory_order_release);
+            eof_reached_.store(false, std::memory_order_release);
+            const PlaybackState loaded_state =
+                paused_.load(std::memory_order_acquire) ? PlaybackState::Paused : PlaybackState::Playing;
+            update_playback_state(loaded_state, /*force_notify=*/true);
             std::function<void(const std::string&)> loaded_cb;
             std::string title;
             {
                 std::lock_guard lock(mutex_);
-                state_cb = callbacks_.on_state_changed;
                 loaded_cb = callbacks_.on_file_loaded;
                 title = media_title_;
             }
-            if (state_cb) state_cb(PlaybackState::Playing);
             if (loaded_cb) loaded_cb(title);
             break;
         }
@@ -959,21 +1012,20 @@ void Player::handle_mpv_event(void* event_ptr) {
         }
 
         case MPV_EVENT_END_FILE: {
-            state_.store(PlaybackState::Idle);
+            file_loaded_.store(false, std::memory_order_release);
+            eof_reached_.store(false, std::memory_order_release);
             time_pos_.store(0.0);
             opening_.store(false);
             seeking_.store(false);
             core_idle_.store(false);
             paused_for_cache_.store(false);
+            update_playback_state(PlaybackState::Idle);
             set_buffering_state(false);
-            std::function<void(PlaybackState)> state_cb;
             std::function<void(double)> pos_cb;
             {
                 std::lock_guard lock(mutex_);
-                state_cb = callbacks_.on_state_changed;
                 pos_cb = callbacks_.on_time_pos;
             }
-            if (state_cb) state_cb(PlaybackState::Idle);
             if (pos_cb) pos_cb(0.0);
             break;
         }

@@ -5,14 +5,30 @@
 #include <mpv/client.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <limits>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
+
+bool wait_mpv_prop_equals(mpv_handle* mpv, const char* prop, std::string_view expected) {
+    for (int i = 0; i < 40; ++i) {
+        char* val = mpv_get_property_string(mpv, prop);
+        if (val != nullptr) {
+            bool match = (std::string_view(val) == expected);
+            mpv_free(val);
+            if (match) return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
 
 mpv_node make_int64_node(int64_t val) {
     mpv_node n{};
@@ -279,36 +295,18 @@ TEST_CASE("Player LoopMode transitions", "[player][loop]") {
     // Off -> File
     REQUIRE(player.set_loop_mode(mpvx::LoopMode::File).has_value());
     REQUIRE(player.loop_mode() == mpvx::LoopMode::File);
-    {
-        char* lf = mpv_get_property_string(player.handle(), "loop-file");
-        REQUIRE(lf != nullptr);
-        REQUIRE(std::string(lf) == "inf");
-        mpv_free(lf);
-    }
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "loop-file", "inf"));
 
     // File -> Playlist
     REQUIRE(player.set_loop_mode(mpvx::LoopMode::Playlist).has_value());
     REQUIRE(player.loop_mode() == mpvx::LoopMode::Playlist);
-    {
-        char* lp = mpv_get_property_string(player.handle(), "loop-playlist");
-        REQUIRE(lp != nullptr);
-        REQUIRE(std::string(lp) == "inf");
-        mpv_free(lp);
-    }
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "loop-playlist", "inf"));
 
     // Playlist -> Off
     REQUIRE(player.set_loop_mode(mpvx::LoopMode::Off).has_value());
     REQUIRE(player.loop_mode() == mpvx::LoopMode::Off);
-    {
-        char* lf = mpv_get_property_string(player.handle(), "loop-file");
-        char* lp = mpv_get_property_string(player.handle(), "loop-playlist");
-        REQUIRE(lf != nullptr);
-        REQUIRE(lp != nullptr);
-        REQUIRE(std::string(lf) == "no");
-        REQUIRE(std::string(lp) == "no");
-        mpv_free(lf);
-        mpv_free(lp);
-    }
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "loop-file", "no"));
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "loop-playlist", "no"));
 
     player.shutdown();
 }
@@ -321,12 +319,7 @@ TEST_CASE("Player Speed, Track, and Aspect controls", "[player][settings]") {
     REQUIRE(std::abs(player.speed() - 1.5) < 0.001);
 
     REQUIRE(player.set_subtitle_track(-1).has_value());
-    {
-        char* sid = mpv_get_property_string(player.handle(), "sid");
-        REQUIRE(sid != nullptr);
-        REQUIRE(std::string(sid) == "no");
-        mpv_free(sid);
-    }
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "sid", "no"));
 
     REQUIRE(player.set_audio_track(1).has_value());
     REQUIRE(player.set_hwdec("auto-safe").has_value());
@@ -374,6 +367,7 @@ TEST_CASE("Player absolute seek forward and backward", "[player][seek]") {
 
     mpvx::Player player;
     REQUIRE(player.initialize().has_value());
+    mpv_set_property_string(player.handle(), "vo", "null");
     mpv_set_property_string(player.handle(), "ao", "null");
 
     std::atomic<int> seek_buffering_events{0};
@@ -489,5 +483,65 @@ TEST_CASE("VideoRenderer renders frames from vo=libmpv without blocking", "[play
     renderer.shutdown();
     player.shutdown();
 }
+
+TEST_CASE("Player play/pause state consistency across load, pause-while-loading, and stop", "[player][state]") {
+    mpvx::Player player;
+    REQUIRE(player.initialize().has_value());
+    mpv_set_property_string(player.handle(), "vo", "null");
+    mpv_set_property_string(player.handle(), "ao", "null");
+
+    std::atomic<mpvx::PlaybackState> last_cb_state{mpvx::PlaybackState::Idle};
+    std::atomic<int> state_cb_count{0};
+    mpvx::PlayerCallbacks cbs;
+    cbs.on_state_changed = [&](mpvx::PlaybackState st) {
+        last_cb_state.store(st, std::memory_order_release);
+        state_cb_count.fetch_add(1, std::memory_order_relaxed);
+    };
+    player.set_callbacks(std::move(cbs));
+
+    // 1. Wait for initial property observation events to settle; must stay Idle and never pulse to Playing
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    REQUIRE(player.state() == mpvx::PlaybackState::Idle);
+    REQUIRE(last_cb_state.load() == mpvx::PlaybackState::Idle);
+
+    // Calling pause() while Idle must NOT transition state() away from Idle
+    REQUIRE(player.pause().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    REQUIRE(player.state() == mpvx::PlaybackState::Idle);
+
+    // 2. Loading a file after being paused must automatically unpause and transition to Playing
+    REQUIRE(player.load_file("av://lavfi:testsrc=duration=2:size=160x120:rate=15").has_value());
+    for (int i = 0; i < 40 && player.state() != mpvx::PlaybackState::Playing; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(player.state() == mpvx::PlaybackState::Playing);
+    REQUIRE(last_cb_state.load() == mpvx::PlaybackState::Playing);
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "pause", "no"));
+
+    // 3. Pausing immediately during load_file must settle in Paused (never overwritten to Playing by FILE_LOADED)
+    REQUIRE(player.load_file("av://lavfi:testsrc=duration=2:size=160x120:rate=15").has_value());
+    REQUIRE(player.pause().has_value());
+    for (int i = 0; i < 40 && (player.is_buffering() || player.state() != mpvx::PlaybackState::Paused); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(player.state() == mpvx::PlaybackState::Paused);
+    REQUIRE(last_cb_state.load() == mpvx::PlaybackState::Paused);
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "pause", "yes"));
+
+    // 4. toggle_pause() from Paused transitions back to Playing
+    REQUIRE(player.toggle_pause().has_value());
+    for (int i = 0; i < 40 && player.state() != mpvx::PlaybackState::Playing; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(player.state() == mpvx::PlaybackState::Playing);
+
+    // 5. stop() immediately transitions state() to Idle
+    REQUIRE(player.stop().has_value());
+    REQUIRE(player.state() == mpvx::PlaybackState::Idle);
+    REQUIRE(last_cb_state.load() == mpvx::PlaybackState::Idle);
+
+    player.shutdown();
+}
+
 
 
