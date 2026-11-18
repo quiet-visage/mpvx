@@ -1,5 +1,6 @@
 #include "app-window.h"
 #include "mpvx/core.hpp"
+#include "mpvx/library.hpp"
 #include "mpvx/player.hpp"
 #include "mpvx/renderer.hpp"
 
@@ -13,47 +14,10 @@
 #include <print>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
-
-// Attempts to open a native desktop file picker asynchronously via zenity or kdialog if available;
-// returns std::nullopt if no GUI picker utility is installed or user cancels.
-std::optional<std::string> run_native_file_dialog(const char* title) {
-    const char* display = std::getenv("DISPLAY");
-    const char* wayland = std::getenv("WAYLAND_DISPLAY");
-    if ((!display || display[0] == '\0') && (!wayland || wayland[0] == '\0')) {
-        return std::nullopt;
-    }
-
-    std::string cmd = std::format(
-        "if command -v zenity >/dev/null 2>&1; then "
-        "zenity --file-selection --title=\"{}\" 2>/dev/null; "
-        "elif command -v kdialog >/dev/null 2>&1; then "
-        "kdialog --getopenfilename . --title \"{}\" 2>/dev/null; "
-        "else exit 127; fi",
-        title, title);
-
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-        return std::nullopt;
-    }
-
-    char buffer[4096];
-    std::string output;
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-    }
-    int status = pclose(pipe);
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-        output.pop_back();
-    }
-
-    if (status == 0 && !output.empty()) {
-        return output;
-    }
-    return std::nullopt;
-}
 
 LoopMode to_slint_loop_mode(mpvx::LoopMode mode) noexcept {
     switch (mode) {
@@ -79,6 +43,244 @@ AbLoopState to_slint_ab_state(mpvx::AbLoopState state) noexcept {
     return AbLoopState::Off;
 }
 
+PickerNavKind to_slint_nav_kind(mpvx::LibraryNavKind kind) noexcept {
+    switch (kind) {
+        case mpvx::LibraryNavKind::Home:
+            return PickerNavKind::Home;
+        case mpvx::LibraryNavKind::ContinueWatching:
+            return PickerNavKind::ContinueWatching;
+        case mpvx::LibraryNavKind::Recent:
+            return PickerNavKind::Recent;
+        case mpvx::LibraryNavKind::Folder:
+            return PickerNavKind::Folder;
+    }
+    return PickerNavKind::Home;
+}
+
+mpvx::LibraryNavKind from_slint_nav_kind(PickerNavKind kind) noexcept {
+    switch (kind) {
+        case PickerNavKind::Home:
+            return mpvx::LibraryNavKind::Home;
+        case PickerNavKind::ContinueWatching:
+            return mpvx::LibraryNavKind::ContinueWatching;
+        case PickerNavKind::Recent:
+            return mpvx::LibraryNavKind::Recent;
+        case PickerNavKind::Folder:
+            return mpvx::LibraryNavKind::Folder;
+    }
+    return mpvx::LibraryNavKind::Home;
+}
+
+mpvx::LibrarySortMode from_slint_sort_mode(PickerSortMode mode) noexcept {
+    switch (mode) {
+        case PickerSortMode::Name:
+            return mpvx::LibrarySortMode::Name;
+        case PickerSortMode::Recent:
+            return mpvx::LibrarySortMode::Recent;
+        case PickerSortMode::Progress:
+            return mpvx::LibrarySortMode::Progress;
+    }
+    return mpvx::LibrarySortMode::Name;
+}
+
+// GUI-thread-only controller managing persistent nested VectorModels and O(1) cell updates
+class PickerUiController {
+public:
+    explicit PickerUiController(slint::ComponentHandle<MainWindow> ui)
+        : ui_(std::move(ui))
+        , folders_model_(std::make_shared<slint::VectorModel<FolderNode>>())
+        , breadcrumbs_model_(std::make_shared<slint::VectorModel<slint::SharedString>>())
+        , continue_model_(std::make_shared<slint::VectorModel<VideoEntry>>())
+        , direct_rows_model_(std::make_shared<slint::VectorModel<VideoGridRow>>())
+        , shelves_model_(std::make_shared<slint::VectorModel<ShelfSection>>())
+    {
+        ui_->set_picker_folders(folders_model_);
+        ui_->set_picker_breadcrumbs(breadcrumbs_model_);
+        ui_->set_picker_continue_watching(continue_model_);
+        ui_->set_picker_direct_video_rows(direct_rows_model_);
+        ui_->set_picker_shelves(shelves_model_);
+    }
+
+    void apply_snapshot(const std::shared_ptr<const mpvx::LibraryViewSnapshot>& snap) {
+        if (!snap) return;
+        last_snapshot_ = snap;
+        key_to_cells_.clear();
+
+        ui_->set_active_nav_kind(to_slint_nav_kind(snap->nav_kind));
+        ui_->set_current_folder_path(slint::SharedString(snap->arena.view(snap->current_folder_path)));
+        ui_->set_picker_scanning(!snap->shelves_complete);
+
+        // Sidebar folders
+        std::vector<FolderNode> fnodes;
+        fnodes.reserve(snap->sidebar_folders.size());
+        for (const auto& f : snap->sidebar_folders) {
+            fnodes.push_back(FolderNode{
+                slint::SharedString(snap->arena.view(f.path)),
+                slint::SharedString(snap->arena.view(f.name)),
+                f.depth,
+                f.has_children,
+                f.expanded,
+                f.selected,
+            });
+        }
+        folders_model_->set_vector(std::move(fnodes));
+
+        // Breadcrumbs
+        std::vector<slint::SharedString> crumbs;
+        crumbs.reserve(snap->breadcrumbs.size());
+        for (const auto& bc : snap->breadcrumbs) {
+            crumbs.emplace_back(snap->arena.view(bc));
+        }
+        breadcrumbs_model_->set_vector(std::move(crumbs));
+
+        // Continue Watching
+        std::vector<VideoEntry> cw_items;
+        cw_items.reserve(snap->continue_watching.size());
+        for (size_t i = 0; i < snap->continue_watching.size(); ++i) {
+            const auto& item = snap->continue_watching[i];
+            cw_items.push_back(to_video_entry(item, snap->arena));
+            key_to_cells_[item.cache_key].push_back(ModelCellRef{continue_model_, i});
+        }
+        continue_model_->set_vector(std::move(cw_items));
+
+        // Direct Video Rows (chunked by grid_columns_)
+        rebuild_direct_rows(*snap);
+
+        // Subcategory Shelves (each backed by a persistent inner VectorModel<VideoEntry>)
+        std::vector<ShelfSection> shelf_sections;
+        shelf_sections.reserve(snap->shelves.size());
+        for (const auto& sh : snap->shelves) {
+            auto inner_model = std::make_shared<slint::VectorModel<VideoEntry>>();
+            std::vector<VideoEntry> items;
+            items.reserve(sh.items.size());
+            for (size_t i = 0; i < sh.items.size(); ++i) {
+                const auto& item = sh.items[i];
+                items.push_back(to_video_entry(item, snap->arena));
+                key_to_cells_[item.cache_key].push_back(ModelCellRef{inner_model, i});
+            }
+            inner_model->set_vector(std::move(items));
+            shelf_sections.push_back(ShelfSection{
+                slint::SharedString(snap->arena.view(sh.folder_path)),
+                slint::SharedString(snap->arena.view(sh.title)),
+                sh.total_count,
+                inner_model,
+            });
+        }
+        shelves_model_->set_vector(std::move(shelf_sections));
+    }
+
+    void apply_thumbnail_updates(std::vector<mpvx::ThumbnailUpdate> updates) {
+        for (auto& u : updates) {
+            slint::Image img;
+            if (u.has_pixels && u.pixels.width() > 0 && u.pixels.height() > 0) {
+                img = slint::Image(u.pixels);
+                cached_images_[u.cache_key] = img;
+            }
+            auto it = key_to_cells_.find(u.cache_key);
+            if (it == key_to_cells_.end()) continue;
+
+            for (const auto& cell : it->second) {
+                if (cell.row_index >= cell.model->row_count()) continue;
+                auto entry_opt = cell.model->row_data(cell.row_index);
+                if (!entry_opt.has_value()) continue;
+                VideoEntry entry = *entry_opt;
+                if (u.has_pixels) {
+                    entry.thumbnail = img;
+                    entry.has_thumbnail = true;
+                }
+                if (u.duration_sec > 0.0) {
+                    entry.duration_sec = static_cast<float>(u.duration_sec);
+                    entry.duration_text = slint::SharedString(u.duration_text);
+                }
+                cell.model->set_row_data(cell.row_index, entry);
+            }
+        }
+    }
+
+    void set_grid_columns(int cols) {
+        const int clamped = std::clamp(cols, 2, 8);
+        if (clamped == grid_columns_) return;
+        grid_columns_ = clamped;
+        ui_->set_picker_grid_columns(grid_columns_);
+        if (last_snapshot_) {
+            apply_snapshot(last_snapshot_);
+        }
+    }
+
+    [[nodiscard]] std::optional<std::string> breadcrumb_path_at(int index) const {
+        if (!last_snapshot_ || index < 0 ||
+            static_cast<size_t>(index) >= last_snapshot_->breadcrumb_paths.size()) {
+            return std::nullopt;
+        }
+        return std::string(last_snapshot_->arena.view(last_snapshot_->breadcrumb_paths[index]));
+    }
+
+private:
+    struct ModelCellRef {
+        std::shared_ptr<slint::VectorModel<VideoEntry>> model;
+        size_t row_index;
+    };
+
+    [[nodiscard]] VideoEntry to_video_entry(
+        const mpvx::ScannedVideoItem& item,
+        const mpvx::StringArena& arena) const
+    {
+        VideoEntry ve;
+        ve.id = slint::SharedString(arena.view(item.id_hex));
+        ve.path = slint::SharedString(arena.view(item.path));
+        ve.title = slint::SharedString(arena.view(item.title));
+        ve.subtitle = slint::SharedString(arena.view(item.subtitle));
+        ve.duration_text = slint::SharedString(arena.view(item.duration_text));
+        ve.duration_sec = static_cast<float>(item.duration_sec);
+        ve.position_sec = static_cast<float>(item.position_sec);
+        ve.progress = item.progress;
+        ve.watched = item.watched;
+        if (auto it = cached_images_.find(item.cache_key); it != cached_images_.end()) {
+            ve.thumbnail = it->second;
+            ve.has_thumbnail = true;
+        } else {
+            ve.has_thumbnail = false;
+        }
+        return ve;
+    }
+
+    void rebuild_direct_rows(const mpvx::LibraryViewSnapshot& snap) {
+        std::vector<VideoGridRow> rows;
+        const size_t cols = static_cast<size_t>(std::max(1, grid_columns_));
+        const size_t total = snap.direct_videos.size();
+        const size_t num_rows = (total + cols - 1) / cols;
+        rows.reserve(num_rows);
+
+        for (size_t r = 0; r < num_rows; ++r) {
+            auto row_model = std::make_shared<slint::VectorModel<VideoEntry>>();
+            std::vector<VideoEntry> row_items;
+            const size_t start = r * cols;
+            const size_t end = std::min(total, start + cols);
+            row_items.reserve(end - start);
+            for (size_t i = start; i < end; ++i) {
+                const auto& item = snap.direct_videos[i];
+                row_items.push_back(to_video_entry(item, snap.arena));
+                key_to_cells_[item.cache_key].push_back(ModelCellRef{row_model, i - start});
+            }
+            row_model->set_vector(std::move(row_items));
+            rows.push_back(VideoGridRow{static_cast<int>(r), row_model});
+        }
+        direct_rows_model_->set_vector(std::move(rows));
+    }
+
+    slint::ComponentHandle<MainWindow> ui_;
+    std::shared_ptr<slint::VectorModel<FolderNode>> folders_model_;
+    std::shared_ptr<slint::VectorModel<slint::SharedString>> breadcrumbs_model_;
+    std::shared_ptr<slint::VectorModel<VideoEntry>> continue_model_;
+    std::shared_ptr<slint::VectorModel<VideoGridRow>> direct_rows_model_;
+    std::shared_ptr<slint::VectorModel<ShelfSection>> shelves_model_;
+
+    int grid_columns_{4};
+    std::shared_ptr<const mpvx::LibraryViewSnapshot> last_snapshot_;
+    std::unordered_map<uint64_t, std::vector<ModelCellRef>> key_to_cells_;
+    std::unordered_map<uint64_t, slint::Image> cached_images_;
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -89,12 +291,33 @@ int main(int argc, char* argv[]) {
 
     auto player = std::make_shared<mpvx::Player>();
     auto renderer = std::make_shared<mpvx::VideoRenderer>();
+    auto library = std::make_shared<mpvx::LibraryService>();
+    auto picker_ui = std::make_shared<PickerUiController>(main_window);
+    auto active_media_path = std::make_shared<std::string>();
 
     auto init_res = player->initialize();
     if (!init_res.has_value()) {
         std::println(stderr, "[mpvx] Error: Could not initialize MPV core: {}", init_res.error().message);
         return 1;
     }
+
+    // Initialize LibraryService off the GUI thread (Zero UI Locks)
+    mpvx::LibraryServiceCallbacks lib_callbacks;
+    lib_callbacks.on_snapshot = [picker_ui](std::shared_ptr<const mpvx::LibraryViewSnapshot> snap) {
+        picker_ui->apply_snapshot(snap);
+    };
+    lib_callbacks.on_thumbnail_updates = [picker_ui](std::vector<mpvx::ThumbnailUpdate> updates) {
+        picker_ui->apply_thumbnail_updates(std::move(updates));
+    };
+    std::weak_ptr<mpvx::LibraryService> lib_weak = library;
+    lib_callbacks.on_schedule_ui_flush = [lib_weak]() {
+        slint::invoke_from_event_loop([lib_weak]() {
+            if (auto lib = lib_weak.lock()) {
+                lib->flush_pending_updates_on_gui_thread();
+            }
+        });
+    };
+    library->initialize(std::move(lib_callbacks));
 
     // Initialize software video renderer -> Slint Image (coalesced to prevent UI queue saturation)
     auto frame_in_flight = std::make_shared<std::atomic<bool>>(false);
@@ -166,12 +389,16 @@ int main(int argc, char* argv[]) {
 
     // Set up player event observers -> Thread-safe UI updates
     mpvx::PlayerCallbacks callbacks;
-    callbacks.on_state_changed = [ui_weak](mpvx::PlaybackState state) {
-        slint::invoke_from_event_loop([ui_weak, state]() {
+    callbacks.on_state_changed = [ui_weak, library, player, active_media_path](mpvx::PlaybackState state) {
+        if (state == mpvx::PlaybackState::Paused && !active_media_path->empty()) {
+            library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+        }
+        slint::invoke_from_event_loop([ui_weak, player]() {
             if (auto ui_opt = ui_weak.lock()) {
                 auto ui = *ui_opt;
-                ui->set_is_playing(state == mpvx::PlaybackState::Playing);
-                if (state == mpvx::PlaybackState::Idle) {
+                const auto latest = player->state();
+                ui->set_is_playing(latest == mpvx::PlaybackState::Playing);
+                if (latest == mpvx::PlaybackState::Idle) {
                     ui->set_has_video(false);
                     ui->set_is_buffering(false);
                 }
@@ -187,8 +414,11 @@ int main(int argc, char* argv[]) {
         });
     };
 
-    callbacks.on_time_pos = [ui_weak, player](double pos) {
+    callbacks.on_time_pos = [ui_weak, player, library, active_media_path](double pos) {
         double dur = player->duration();
+        if (!active_media_path->empty() && dur > 0.0) {
+            library->record_playback_progress(*active_media_path, pos, dur, false);
+        }
         float progress = dur > 0.0 ? static_cast<float>(std::clamp(pos / dur, 0.0, 1.0)) : 0.0f;
         std::string time_str = mpvx::format_time_readout(pos, dur);
 
@@ -341,6 +571,7 @@ int main(int argc, char* argv[]) {
         (void)player->stop();
         if (auto ui_opt = ui_weak.lock()) {
             auto ui = *ui_opt;
+            ui->set_is_playing(false);
             ui->set_has_video(false);
             ui->set_is_buffering(false);
             ui->set_progress(0.0f);
@@ -404,11 +635,11 @@ int main(int argc, char* argv[]) {
         (void)player->set_subtitle_track(sid);
     });
 
-    main_window->on_load_external_subtitle_clicked([player, ui_weak]() {
-        std::thread([player, ui_weak]() {
-            if (auto chosen = run_native_file_dialog("Select External Subtitle File")) {
-                std::string path = *chosen;
-                slint::invoke_from_event_loop([player, path]() {
+    main_window->on_load_external_subtitle_clicked([player, library, ui_weak]() {
+        library->open_media_file_dialog("Select External Subtitle File", [player, ui_weak](std::optional<std::string> chosen) {
+            if (chosen.has_value()) {
+                std::string path = std::move(*chosen);
+                slint::invoke_from_event_loop([player, path = std::move(path)]() {
                     (void)player->add_subtitle_file(path);
                 });
             } else {
@@ -418,7 +649,7 @@ int main(int argc, char* argv[]) {
                     }
                 });
             }
-        }).detach();
+        });
     });
 
     main_window->on_audio_track_selected([player](int aid) {
@@ -441,25 +672,45 @@ int main(int argc, char* argv[]) {
         (void)player->set_aspect_override(std::string_view(aspect));
     });
 
-    main_window->on_open_url_submitted([player, ui_weak](slint::SharedString url) {
+    main_window->on_open_url_submitted([player, library, ui_weak, active_media_path](slint::SharedString url) {
         std::string target(url);
         if (target.empty()) return;
+        if (!active_media_path->empty()) {
+            library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+        }
+        *active_media_path = target;
+        player->clear_pending_resume();
         std::println("[mpvx] Loading media: {}", target);
         if (auto ui_opt = ui_weak.lock()) {
-            (*ui_opt)->set_media_title(slint::SharedString(target));
+            auto ui = *ui_opt;
+            ui->set_media_title(slint::SharedString(target));
+            ui->set_view_mode(AppViewMode::Player);
+            ui->set_hud_visible(true);
+            ui->set_pointer_idle_ms(0);
         }
         (void)player->load_file(target);
+        (void)player->play();
     });
 
-    main_window->on_open_file_clicked([player, ui_weak]() {
-        std::thread([player, ui_weak]() {
-            if (auto chosen = run_native_file_dialog("Open Media File")) {
-                std::string path = *chosen;
-                slint::invoke_from_event_loop([player, ui_weak, path]() {
+    main_window->on_open_file_clicked([player, library, ui_weak, active_media_path]() {
+        library->open_media_file_dialog("Open Media File", [player, library, ui_weak, active_media_path](std::optional<std::string> chosen) {
+            if (chosen.has_value()) {
+                std::string path = std::move(*chosen);
+                slint::invoke_from_event_loop([player, library, ui_weak, active_media_path, path = std::move(path)]() {
+                    if (!active_media_path->empty()) {
+                        library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+                    }
+                    *active_media_path = path;
+                    player->clear_pending_resume();
                     if (auto ui_opt = ui_weak.lock()) {
-                        (*ui_opt)->set_media_title(slint::SharedString(path));
+                        auto ui = *ui_opt;
+                        ui->set_media_title(slint::SharedString(path));
+                        ui->set_view_mode(AppViewMode::Player);
+                        ui->set_hud_visible(true);
+                        ui->set_pointer_idle_ms(0);
                     }
                     (void)player->load_file(path);
+                    (void)player->play();
                 });
             } else {
                 slint::invoke_from_event_loop([ui_weak]() {
@@ -468,7 +719,112 @@ int main(int argc, char* argv[]) {
                     }
                 });
             }
-        }).detach();
+        });
+    });
+
+    // --- Video Picker Callbacks ---
+    main_window->on_picker_nav_selected([library](PickerNavKind kind, slint::SharedString path) {
+        library->navigate(from_slint_nav_kind(kind), std::string(path));
+    });
+
+    main_window->on_picker_folder_toggled([library](slint::SharedString path) {
+        library->toggle_folder_expanded(std::string(path));
+    });
+
+    main_window->on_picker_breadcrumb_clicked([library, picker_ui](int idx) {
+        if (auto p = picker_ui->breadcrumb_path_at(idx)) {
+            if (*p == library->videos_root().string()) {
+                library->navigate(mpvx::LibraryNavKind::Home);
+            } else {
+                library->navigate(mpvx::LibraryNavKind::Folder, std::move(*p));
+            }
+        }
+    });
+
+    main_window->on_picker_navigate_up([library]() {
+        library->navigate_up();
+    });
+
+    main_window->on_picker_video_clicked([player, library, ui_weak, active_media_path](slint::SharedString path, bool resume) {
+        std::string target(path);
+        if (target.empty()) return;
+        if (!active_media_path->empty() && *active_media_path != target) {
+            library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+        }
+        *active_media_path = target;
+
+        if (resume) {
+            if (auto entry = library->get_watch_entry(target); entry.has_value() && entry->is_in_progress()) {
+                player->set_pending_resume(entry->position_sec);
+            } else {
+                player->clear_pending_resume();
+            }
+        } else {
+            player->clear_pending_resume();
+        }
+
+        if (auto ui_opt = ui_weak.lock()) {
+            auto ui = *ui_opt;
+            ui->set_media_title(slint::SharedString(mpvx::normalize_video_title(
+                std::filesystem::path(target).filename().string())));
+            ui->set_view_mode(AppViewMode::Player);
+            ui->set_hud_visible(true);
+            ui->set_pointer_idle_ms(0);
+        }
+        (void)player->load_file(target);
+        (void)player->play();
+    });
+
+    main_window->on_picker_mark_watched([library](slint::SharedString path, bool watched) {
+        library->mark_watched(std::string_view(path), watched);
+    });
+
+    main_window->on_picker_reveal_in_file_manager([library](slint::SharedString path) {
+        library->reveal_in_file_manager(std::string_view(path));
+    });
+
+    main_window->on_picker_request_thumbnail([library](slint::SharedString id_hex, slint::SharedString path) {
+        library->request_thumbnail(std::string_view(id_hex), std::string_view(path));
+    });
+
+    main_window->on_picker_grid_columns_changed([picker_ui](int cols) {
+        picker_ui->set_grid_columns(cols);
+    });
+
+    main_window->on_picker_search_changed([library](slint::SharedString query) {
+        library->set_search_query(std::string(query));
+    });
+
+    main_window->on_picker_sort_changed([library](PickerSortMode mode) {
+        library->set_sort_mode(from_slint_sort_mode(mode));
+    });
+
+    main_window->on_picker_open_external_folder([library]() {
+        library->open_external_folder_dialog([library](std::string dir) {
+            slint::invoke_from_event_loop([library, dir = std::move(dir)]() {
+                library->navigate(mpvx::LibraryNavKind::Folder, dir);
+            });
+        });
+    });
+
+    main_window->on_return_to_picker_clicked([player, library, ui_weak, active_media_path]() {
+        if (!active_media_path->empty()) {
+            library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+        }
+        (void)player->pause();
+        library->request_refresh();
+        if (auto ui_opt = ui_weak.lock()) {
+            (*ui_opt)->set_view_mode(AppViewMode::Picker);
+        }
+    });
+
+    main_window->on_return_to_player_clicked([ui_weak]() {
+        if (auto ui_opt = ui_weak.lock()) {
+            auto ui = *ui_opt;
+            ui->set_view_mode(AppViewMode::Player);
+            ui->set_hud_visible(true);
+            ui->set_pointer_idle_ms(0);
+        }
     });
 
     // Frameless Window Management
@@ -523,14 +879,22 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string arg = argv[1];
         std::println("[mpvx] Loading media from argument: {}", arg);
+        *active_media_path = arg;
+        main_window->set_view_mode(AppViewMode::Player);
         main_window->set_media_title(slint::SharedString(arg));
         (void)player->load_file(arg);
+    } else {
+        main_window->set_view_mode(AppViewMode::Picker);
     }
 
     std::println("[mpvx] Launching GUI event loop...");
     main_window->run();
 
     std::println("[mpvx] Window closed, shutting down...");
+    if (!active_media_path->empty()) {
+        library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
+    }
+    library->shutdown();
     renderer->shutdown();
     player->shutdown();
 
