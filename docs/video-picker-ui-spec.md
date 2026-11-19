@@ -361,24 +361,28 @@ Every video file is uniquely identified by a 64-bit fingerprint computed from it
 - **Why Not Decode JPEG on the GUI Thread?**
   Calling `slint::Image::load_from_path()` (`<slint/private/slint_image.h>`) on the Slint GUI thread performs synchronous file I/O and JPEG decompression during frame painting, causing `5ms–25ms` frame spikes when scrolling through shelves.
 - **Uncompressed / Fast-Header `.mpxt` Thumbnail Format:**
-  - Thumbnails are cached on disk at `$XDG_CACHE_HOME/mpvx/thumbnails/<16-hex-char-key>.mpxt` at a fixed `320×180` (16:9) resolution (`230,400` bytes of raw `Rgba8Pixel` data preceded by a 16-byte header: `magic = 0x5458504D`, `width = 320`, `height = 180`, `format = 1`).
+  - Thumbnails are cached on disk at `$XDG_CACHE_HOME/mpvx/thumbnails/<16-hex-char-key>.mpxt` at a fixed `320×180` (16:9) resolution (`230,400` bytes of raw `Rgba8Pixel` data preceded by a 16-byte header: `magic = 0x5458504D`, `width = 320`, `height = 180`, `format = 4`).
   - **Worker-Thread Hydration:** A background worker reads the `230 KB` file directly into a `slint::SharedPixelBuffer<slint::Rgba8Pixel>(320, 180)` (`buffer.begin()`) in `< 0.15ms` with **zero image decompression CPU overhead**, then sends the `SharedPixelBuffer` to the GUI thread where `slint::Image(buffer)` (`<slint/private/slint_image.h>`) wraps it in $O(1)$ time.
   - **Atomic Write-Rename:** Thumbnail workers always write to `<key>.mpxt.tmp.<tid>` and call `std::filesystem::rename` (`rename(2)`) so readers never observe a half-written thumbnail file.
 
-### 7.5 Thumbnail Generation Backend (Persistent Thread-Local Worker Contexts, Isolated From Active Playback)
+### 7.5 Thumbnail Generation Backend (3-Tier Zero-Waste Pipeline, Isolated From Active Playback)
 - **Constraint From `libmpv` Documentation ([render.h](file:///var/home/anon/projects/mpvx/.deps/libmpv/include/mpv/render.h#L117-L153)):**
   1. [render.h:117](file:///var/home/anon/projects/mpvx/.deps/libmpv/include/mpv/render.h#L117): *"Currently, there can be only 1 `mpv_render_context` at a time per mpv core."*
   2. [render.h:63-64](file:///var/home/anon/projects/mpvx/.deps/libmpv/include/mpv/render.h#L63-L64): `mpv_render_*` calls on a separate `mpv_handle` core are completely independent of the main playback core.
 - **Architecture:**
-  - The thumbnail worker pool (`T4..T5`) **NEVER** touches `Player::handle()` ([include/mpvx/player.hpp](file:///var/home/anon/projects/mpvx/include/mpvx/player.hpp#L88)) or `VideoRenderer` ([include/mpvx/renderer.hpp](file:///var/home/anon/projects/mpvx/include/mpvx/renderer.hpp)).
-  - **Primary Strategy (Persistent Thread-Local `mpv_handle` + Software Render Context per Worker):**
-    - Avoid spawning a new `ffmpeg` subprocess or calling `mpv_create()` / `mpv_initialize()` per video file (which costs `15ms–40ms` of dynamic linker and core initialization overhead per thumbnail).
-    - Instead, each thumbnail worker thread (`T4`, `T5`) lazily initializes **one persistent thread-local `mpv_handle*`** ([client.h](file:///var/home/anon/projects/mpvx/.deps/libmpv/include/mpv/client.h#L481)) and **one persistent `mpv_render_context*`** (`MPV_RENDER_API_TYPE_SW` at `320×180`, matching [src/renderer.cpp](file:///var/home/anon/projects/mpvx/src/renderer.cpp#L39-L45)) configured once with:
-      `vo=libmpv`, `ao=null`, `vid=1`, `aid=no`, `sid=no`, `hwdec=auto-safe`, `hr-seek=no`, `vd-lavc-fast=yes`, `vd-lavc-skiploopfilter=all`, `demuxer-readahead-secs=0`, `cache=no`, `pause=yes`.
-    - For each uncached file, the worker reuses its persistent `mpv_handle`:
-      1. Issues `loadfile <path> replace` with per-file option `start=#1` (or `start=10%`), waits for `MPV_EVENT_FILE_LOADED` / `MPV_EVENT_PLAYBACK_RESTART` on that worker's private handle (checking `nav_epoch_` and `stop_token` with a `20ms` poll timeout).
-      2. Queries `mpv_get_property(worker_mpv, "duration", MPV_FORMAT_DOUBLE, &duration_sec)` and `"width"` / `"height"` in the same pass—populating both `MediaIndexRecord` and the `320×180` `SharedPixelBuffer<Rgba8Pixel>` via `mpv_render_context_render` without spawning any external process.
-  - **Optional Fallback (`ffmpeg` Pipe via `posix_spawnp`):** If the isolated software render context fails on an exotic container, falls back to `ffmpeg -nostdin -v error -ss <seek_sec> -i <path> -frames:v 1 -vf scale=320:180:force_original_aspect_ratio=increase,crop=320:180 -f rawvideo -pix_fmt rgba -`.
+  - The thumbnail worker pool (`clamp(hardware_concurrency / 2, 2, 4)` `std::jthread` workers) **NEVER** touches `Player::handle()` ([include/mpvx/player.hpp](file:///var/home/anon/projects/mpvx/include/mpvx/player.hpp#L88)) or `VideoRenderer` ([include/mpvx/renderer.hpp](file:///var/home/anon/projects/mpvx/include/mpvx/renderer.hpp)).
+  - **Tier 1A — Zero-Decoder Direct Container Cover Extraction (`< 0.5ms` probe + `~5–25ms` decode):**
+    - Before initializing any video decoder, `probe_container_for_thumbnail()` reads container headers directly in-process:
+      - **Matroska / WebM (EBML):** Parses `SeekHead`, `Info` (`TimecodeScale`, `Duration`), `Tracks` (`PixelWidth`, `PixelHeight`), and `Attachments` (`AttachedFile` image payloads such as `cover.webp` / `cover.png` / `cover.jpg`, skipping font attachments).
+      - **ISOBMFF (`.mp4`, `.m4v`, `.mov`):** Walks top-level boxes (skipping `mdat` in $O(1)$ via `seekg`) and reads `moov` (`mvhd` duration, `trak/tkhd` video dimensions, and `udta/meta/ilst/covr/data` cover art).
+    - When embedded cover bytes are found, `decode_and_resize_cover_image()` decodes them in-process via `slint::Image::load_from_data().to_rgba8()` and performs a centered aspect-fill (`cover`) box-filter downsample to `320×180` (`resize_cover_rgba8()`) with zero `libmpv` or subprocess overhead.
+  - **Tier 1B — Adjacent Sidecar Cover Image:**
+    - If no embedded container cover exists, checks for `<stem>.{webp,jpg,jpeg,png}` next to the video file and decodes it in-process.
+  - **Tier 2 — Single-Pass `libmpv` 10% Frame Fallback:**
+    - Only when neither an embedded container cover nor a sidecar image exists, each worker uses a persistent thread-local `mpv_handle*` + `mpv_render_context*` (`MPV_RENDER_API_TYPE_SW` at `320×180`) configured with:
+      `vo=libmpv`, `ao=null`, `vid=auto`, `aid=no`, `sid=no`, `hwdec=no`, `load-scripts=no`, `osc=no`, `osd-level=0`, `sub-auto=no`, `audio-file-auto=no`, `autoload-files=no`, `vd-lavc-threads=2`, `hr-seek=no`, `vd-lavc-fast=yes`, `vd-lavc-skiploopfilter=all`, `demuxer-readahead-secs=0`, `cache=no`, `pause=yes`, `keep-open=yes`, `image-display-duration=inf`, `video-timing-offset=0`, `msg-level=all=no`.
+    - Because Tier 1A already parsed MKV/WebM/MP4/MOV headers (`probe.parsed == true`) and extracted duration/dimensions, `ThreadLocalThumbExtractor` skips loading frame `t=0` and jumps straight to a **single-pass** `loadfile` with `vid=1,start=10%`. For exotic containers (`.avi`, `.flv`, `.ts`, `.wmv`), it loads `vid=auto`, checks `track-list` for any embedded `albumart`/`image` track, and otherwise seeks `10%` in-place.
+  - **Optional Last-Resort Fallback (`ffmpeg` Pipe via `posix_spawnp`):** If the isolated software render context fails on an exotic container, seeks `10%` (`-ss <10%_sec>` / `-ss 1` / frame 0) with cancellation and deadline enforcement.
 
 ---
 
