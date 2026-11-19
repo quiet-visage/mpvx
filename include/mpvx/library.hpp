@@ -15,6 +15,7 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -22,6 +23,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+struct mpv_node;
 
 namespace mpvx {
 
@@ -167,7 +170,7 @@ struct alignas(4) MpxtHeader {
     uint32_t magic{0x5458504D}; // "MPXT"
     uint32_t width{kThumbnailWidth};
     uint32_t height{kThumbnailHeight};
-    uint32_t format{1}; // 1 = RGBA8
+    uint32_t format{4}; // 4 = RGBA8 (v4: direct EBML/ISOBMFF cover + sidecar + single-pass 10% fallback)
 };
 static_assert(sizeof(MpxtHeader) == 16);
 
@@ -253,6 +256,34 @@ static_assert(sizeof(MpxtHeader) == 16);
 parse_watch_history(std::string_view content);
 [[nodiscard]] std::string
 serialize_watch_history(const std::unordered_map<std::string, WatchHistoryEntry>& entries);
+
+struct VideoTrackProbeResult {
+    int embedded_thumb_vid{-1};
+    int primary_video_vid{-1};
+    int selected_vid{-1};
+    uint32_t primary_width{0};
+    uint32_t primary_height{0};
+};
+
+struct ContainerProbeResult {
+    bool parsed{false};
+    bool has_embedded_cover{false};
+    double duration_sec{0.0};
+    uint32_t width{0};
+    uint32_t height{0};
+    std::string cover_format;
+    std::vector<uint8_t> cover_data;
+};
+
+[[nodiscard]] VideoTrackProbeResult inspect_track_list_for_thumbnail(const mpv_node& root) noexcept;
+[[nodiscard]] ContainerProbeResult probe_container_for_thumbnail(const std::filesystem::path& path);
+[[nodiscard]] slint::SharedPixelBuffer<slint::Rgba8Pixel> resize_cover_rgba8(
+    const slint::SharedPixelBuffer<slint::Rgba8Pixel>& src,
+    uint32_t dst_w = kThumbnailWidth,
+    uint32_t dst_h = kThumbnailHeight);
+[[nodiscard]] std::optional<slint::SharedPixelBuffer<slint::Rgba8Pixel>> decode_and_resize_cover_image(
+    std::span<const uint8_t> encoded_bytes,
+    std::string_view format_hint = {});
 
 [[nodiscard]] std::vector<MediaIndexRecord>
 read_media_index_file(const std::filesystem::path& path);

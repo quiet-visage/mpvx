@@ -4,13 +4,17 @@
 #include <mpv/render.h>
 
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -210,10 +214,763 @@ constexpr uint64_t kCrc64Poly = 0xC96C5795D7870F42ULL;
     return out;
 }
 
-// Persistent thread-local libmpv software thumbnail extractor
+// ============================================================================
+// Zero-Decoder Container Cover-Art & Metadata Probing (EBML + ISOBMFF)
+// ============================================================================
+
+constexpr size_t kMaxCoverPayloadBytes = 8ULL * 1024ULL * 1024ULL;
+constexpr size_t kMaxMetaSectionBytes = 512ULL * 1024ULL;
+
+[[nodiscard]] std::string sniff_image_format(std::span<const uint8_t> bytes) {
+    if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+        return "jpg";
+    }
+    if (bytes.size() >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E &&
+        bytes[3] == 0x47 && bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A &&
+        bytes[7] == 0x0A) {
+        return "png";
+    }
+    if (bytes.size() >= 12 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' &&
+        bytes[3] == 'F' && bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' &&
+        bytes[11] == 'P') {
+        return "webp";
+    }
+    if (bytes.size() >= 4 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F' &&
+        bytes[3] == '8') {
+        return "gif";
+    }
+    if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M') {
+        return "bmp";
+    }
+    return {};
+}
+
+[[nodiscard]] uint32_t read_be32(const uint8_t* p) noexcept {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+[[nodiscard]] uint64_t read_be64(const uint8_t* p) noexcept {
+    return (static_cast<uint64_t>(read_be32(p)) << 32) |
+           static_cast<uint64_t>(read_be32(p + 4));
+}
+
+[[nodiscard]] uint64_t read_be_uint(std::span<const uint8_t> bytes) noexcept {
+    uint64_t v = 0;
+    const size_t n = std::min<size_t>(bytes.size(), 8);
+    for (size_t i = 0; i < n; ++i) {
+        v = (v << 8) | bytes[i];
+    }
+    return v;
+}
+
+[[nodiscard]] double read_ebml_float(std::span<const uint8_t> bytes) noexcept {
+    if (bytes.size() == 4) {
+        const uint32_t raw = read_be32(bytes.data());
+        float f = 0.0f;
+        std::memcpy(&f, &raw, sizeof(f));
+        return static_cast<double>(f);
+    }
+    if (bytes.size() == 8) {
+        const uint64_t raw = read_be64(bytes.data());
+        double d = 0.0;
+        std::memcpy(&d, &raw, sizeof(d));
+        return d;
+    }
+    return 0.0;
+}
+
+bool read_ebml_id(std::span<const uint8_t> buf, size_t& pos, uint32_t& out_id) noexcept {
+    if (pos >= buf.size()) return false;
+    const uint8_t b = buf[pos];
+    if (b == 0) return false;
+    int len = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (b & (0x80U >> i)) {
+            len = i + 1;
+            break;
+        }
+    }
+    if (len == 0 || pos + static_cast<size_t>(len) > buf.size()) return false;
+    uint32_t id = 0;
+    for (int i = 0; i < len; ++i) {
+        id = (id << 8) | buf[pos + static_cast<size_t>(i)];
+    }
+    pos += static_cast<size_t>(len);
+    out_id = id;
+    return true;
+}
+
+bool read_ebml_size(
+    std::span<const uint8_t> buf,
+    size_t& pos,
+    uint64_t& out_size,
+    bool& out_unknown) noexcept
+{
+    if (pos >= buf.size()) return false;
+    const uint8_t b = buf[pos];
+    if (b == 0) return false;
+    int len = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (b & (0x80U >> i)) {
+            len = i + 1;
+            break;
+        }
+    }
+    if (len == 0 || pos + static_cast<size_t>(len) > buf.size()) return false;
+    const uint8_t first_mask = static_cast<uint8_t>((1U << (8 - len)) - 1U);
+    uint64_t val = buf[pos] & first_mask;
+    uint64_t all_ones = first_mask;
+    for (int i = 1; i < len; ++i) {
+        val = (val << 8) | buf[pos + static_cast<size_t>(i)];
+        all_ones = (all_ones << 8) | 0xFFULL;
+    }
+    pos += static_cast<size_t>(len);
+    out_unknown = (val == all_ones);
+    out_size = val;
+    return true;
+}
+
+bool read_ebml_element(
+    std::span<const uint8_t> buf,
+    size_t& pos,
+    uint32_t& out_id,
+    std::span<const uint8_t>& out_payload) noexcept
+{
+    uint64_t sz = 0;
+    bool unk = false;
+    if (!read_ebml_id(buf, pos, out_id) || !read_ebml_size(buf, pos, sz, unk) || unk) {
+        return false;
+    }
+    if (sz > buf.size() - pos) {
+        return false;
+    }
+    out_payload = buf.subspan(pos, static_cast<size_t>(sz));
+    pos += static_cast<size_t>(sz);
+    return true;
+}
+
+void parse_mkv_info(std::span<const uint8_t> info_data, double& out_duration_sec) noexcept {
+    uint64_t timecode_scale = 1'000'000ULL;
+    double raw_duration = 0.0;
+    size_t pos = 0;
+    int iters = 0;
+    while (pos < info_data.size() && ++iters < 512) {
+        uint32_t id = 0;
+        std::span<const uint8_t> payload;
+        if (!read_ebml_element(info_data, pos, id, payload)) {
+            break;
+        }
+        if (id == 0x2AD7B1U) {
+            const uint64_t ts = read_be_uint(payload);
+            if (ts > 0) timecode_scale = ts;
+        } else if (id == 0x4489U) {
+            raw_duration = read_ebml_float(payload);
+        }
+    }
+    if (raw_duration > 0.0) {
+        out_duration_sec = raw_duration * (static_cast<double>(timecode_scale) / 1'000'000'000.0);
+    }
+}
+
+void parse_mkv_tracks(
+    std::span<const uint8_t> tracks_data,
+    uint32_t& out_width,
+    uint32_t& out_height,
+    int& out_video_tracks) noexcept
+{
+    size_t pos = 0;
+    int iters = 0;
+    while (pos < tracks_data.size() && ++iters < 256) {
+        uint32_t id = 0;
+        std::span<const uint8_t> entry;
+        if (!read_ebml_element(tracks_data, pos, id, entry)) {
+            break;
+        }
+        if (id != 0xAEU) continue; // TrackEntry
+
+        uint64_t track_type = 0;
+        uint32_t vw = 0;
+        uint32_t vh = 0;
+        size_t epos = 0;
+        int eiters = 0;
+        while (epos < entry.size() && ++eiters < 128) {
+            uint32_t eid = 0;
+            std::span<const uint8_t> epay;
+            if (!read_ebml_element(entry, epos, eid, epay)) {
+                break;
+            }
+            if (eid == 0x83U) {
+                track_type = read_be_uint(epay);
+            } else if (eid == 0xE0U) { // Video
+                size_t vpos = 0;
+                int viters = 0;
+                while (vpos < epay.size() && ++viters < 64) {
+                    uint32_t vid = 0;
+                    std::span<const uint8_t> vpay;
+                    if (!read_ebml_element(epay, vpos, vid, vpay)) {
+                        break;
+                    }
+                    if (vid == 0xB0U) {
+                        vw = static_cast<uint32_t>(read_be_uint(vpay));
+                    } else if (vid == 0xBAU) {
+                        vh = static_cast<uint32_t>(read_be_uint(vpay));
+                    }
+                }
+            }
+        }
+        if (track_type == 1) {
+            ++out_video_tracks;
+            if (out_width == 0 && out_height == 0 && vw > 0 && vh > 0) {
+                out_width = vw;
+                out_height = vh;
+            }
+        }
+    }
+}
+
+[[nodiscard]] int score_cover_candidate(std::string_view fname, std::string_view mime) noexcept {
+    // Magic bytes are already verified by sniff_image_format(), so accept generic
+    // MIME types like application/octet-stream with a lower preference score.
+    int score = (!mime.empty() && !icase_contains(mime, "image/")) ? 6 : 10;
+    if (icase_contains(fname, "cover") || icase_contains(fname, "folder") ||
+        icase_contains(fname, "poster") || icase_contains(fname, "thumb")) {
+        score += 100;
+    }
+    if (icase_contains(fname, "small")) {
+        score -= 5;
+    }
+    return score;
+}
+
+void parse_mkv_attachments(
+    std::span<const uint8_t> att_data,
+    ContainerProbeResult& out)
+{
+    int best_score = -1;
+    size_t pos = 0;
+    int iters = 0;
+    while (pos < att_data.size() && ++iters < 256) {
+        uint32_t id = 0;
+        std::span<const uint8_t> attached;
+        if (!read_ebml_element(att_data, pos, id, attached)) {
+            break;
+        }
+        if (id != 0x61A7U) continue; // AttachedFile
+
+        std::string_view fname;
+        std::string_view mime;
+        std::span<const uint8_t> file_data;
+        size_t apos = 0;
+        int aiters = 0;
+        while (apos < attached.size() && ++aiters < 64) {
+            uint32_t aid = 0;
+            std::span<const uint8_t> apay;
+            if (!read_ebml_element(attached, apos, aid, apay)) {
+                break;
+            }
+            if (aid == 0x466EU) {
+                fname = std::string_view(reinterpret_cast<const char*>(apay.data()), apay.size());
+            } else if (aid == 0x4660U) {
+                mime = std::string_view(reinterpret_cast<const char*>(apay.data()), apay.size());
+            } else if (aid == 0x465CU) {
+                file_data = apay;
+            }
+        }
+
+        if (file_data.empty() || file_data.size() > kMaxCoverPayloadBytes) continue;
+        std::string fmt = sniff_image_format(file_data);
+        if (fmt.empty()) continue;
+
+        const int score = score_cover_candidate(fname, mime);
+        if (score > best_score) {
+            best_score = score;
+            out.has_embedded_cover = true;
+            out.cover_format = std::move(fmt);
+            out.cover_data.assign(file_data.begin(), file_data.end());
+        }
+    }
+}
+
+[[nodiscard]] bool read_file_slice(
+    std::ifstream& ifs,
+    uint64_t offset,
+    size_t max_bytes,
+    std::vector<uint8_t>& out)
+{
+    ifs.clear();
+    ifs.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!ifs) return false;
+    out.resize(max_bytes);
+    ifs.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(max_bytes));
+    const auto got = ifs.gcount();
+    if (got <= 0) {
+        out.clear();
+        return false;
+    }
+    out.resize(static_cast<size_t>(got));
+    return true;
+}
+
+[[nodiscard]] ContainerProbeResult probe_matroska_container(
+    std::ifstream& ifs,
+    std::span<const uint8_t> initial_hdr,
+    uint64_t file_size)
+{
+    ContainerProbeResult res;
+    size_t pos = 0;
+    uint32_t ebml_id = 0;
+    uint64_t ebml_sz = 0;
+    bool ebml_unk = false;
+    if (!read_ebml_id(initial_hdr, pos, ebml_id) || ebml_id != 0x1A45DFA3U ||
+        !read_ebml_size(initial_hdr, pos, ebml_sz, ebml_unk) || ebml_unk ||
+        ebml_sz > initial_hdr.size() - pos) {
+        return res;
+    }
+    pos += static_cast<size_t>(ebml_sz);
+    if (pos >= initial_hdr.size()) return res;
+
+    uint32_t seg_id = 0;
+    uint64_t seg_sz = 0;
+    bool seg_unk = false;
+    if (!read_ebml_id(initial_hdr, pos, seg_id) || seg_id != 0x18538067U ||
+        !read_ebml_size(initial_hdr, pos, seg_sz, seg_unk)) {
+        return res;
+    }
+
+    res.parsed = true;
+    const uint64_t seg_data_offset = pos;
+    bool got_info = false;
+    bool got_tracks = false;
+    bool got_attachments = false;
+    int mkv_video_tracks = 0;
+
+    uint64_t seek_info_off = 0;
+    uint64_t seek_tracks_off = 0;
+    uint64_t seek_att_off = 0;
+    bool has_seek_info = false;
+    bool has_seek_tracks = false;
+    bool has_seek_att = false;
+
+    auto parse_seek_head = [&](std::span<const uint8_t> sh_data) {
+        size_t spos = 0;
+        int siters = 0;
+        while (spos < sh_data.size() && ++siters < 128) {
+            uint32_t sid = 0;
+            std::span<const uint8_t> entry;
+            if (!read_ebml_element(sh_data, spos, sid, entry)) {
+                break;
+            }
+            if (sid != 0x4DBBU) continue;
+
+            uint32_t target_id = 0;
+            uint64_t target_pos = 0;
+            bool have_id = false;
+            bool have_pos = false;
+            size_t epos = 0;
+            while (epos < entry.size()) {
+                uint32_t eid = 0;
+                std::span<const uint8_t> epay;
+                if (!read_ebml_element(entry, epos, eid, epay)) {
+                    break;
+                }
+                if (eid == 0x53ABU && epay.size() <= 4) {
+                    target_id = static_cast<uint32_t>(read_be_uint(epay));
+                    have_id = true;
+                } else if (eid == 0x53ACU && epay.size() <= 8) {
+                    target_pos = read_be_uint(epay);
+                    have_pos = true;
+                }
+            }
+            if (have_id && have_pos && seg_data_offset <= file_size &&
+                target_pos <= file_size - seg_data_offset) {
+                const uint64_t abs_off = seg_data_offset + target_pos;
+                if (target_id == 0x1549A966U && !has_seek_info) {
+                    seek_info_off = abs_off;
+                    has_seek_info = true;
+                } else if (target_id == 0x1654AE6BU && !has_seek_tracks) {
+                    seek_tracks_off = abs_off;
+                    has_seek_tracks = true;
+                } else if (target_id == 0x1941A469U && !has_seek_att) {
+                    seek_att_off = abs_off;
+                    has_seek_att = true;
+                }
+            }
+        }
+    };
+
+    auto dispatch_top_element = [&](uint32_t cid, std::span<const uint8_t> payload) {
+        if (cid == 0x114D9B74U) {
+            parse_seek_head(payload);
+        } else if (cid == 0x1549A966U && !got_info) {
+            parse_mkv_info(payload, res.duration_sec);
+            got_info = true;
+        } else if (cid == 0x1654AE6BU && !got_tracks) {
+            parse_mkv_tracks(payload, res.width, res.height, mkv_video_tracks);
+            got_tracks = true;
+        } else if (cid == 0x1941A469U && !got_attachments) {
+            parse_mkv_attachments(payload, res);
+            got_attachments = true;
+        }
+    };
+
+    // Scan top-level elements present in initial header buffer
+    int iters = 0;
+    while (pos < initial_hdr.size() && ++iters < 64) {
+        const size_t elem_start = pos;
+        uint32_t cid = 0;
+        uint64_t csz = 0;
+        bool cunk = false;
+        if (!read_ebml_id(initial_hdr, pos, cid) || !read_ebml_size(initial_hdr, pos, csz, cunk)) {
+            break;
+        }
+        if (cid == 0x1F43B675U) { // Cluster reached
+            break;
+        }
+        if (cunk) break;
+        if (csz <= initial_hdr.size() - pos) {
+            dispatch_top_element(cid, initial_hdr.subspan(pos, static_cast<size_t>(csz)));
+            pos += static_cast<size_t>(csz);
+        } else {
+            // Element extends past initial buffer; record SeekHead/element offset for targeted read
+            if (cid == 0x1941A469U && !has_seek_att) {
+                seek_att_off = elem_start;
+                has_seek_att = true;
+            } else if (cid == 0x1549A966U && !has_seek_info) {
+                seek_info_off = elem_start;
+                has_seek_info = true;
+            } else if (cid == 0x1654AE6BU && !has_seek_tracks) {
+                seek_tracks_off = elem_start;
+                has_seek_tracks = true;
+            }
+            break;
+        }
+    }
+
+    auto read_element_at = [&](uint32_t expected_id, uint64_t offset, size_t cap) {
+        if (offset >= file_size) return;
+        std::vector<uint8_t> hdr_peek;
+        if (!read_file_slice(ifs, offset, 16, hdr_peek)) return;
+        size_t p = 0;
+        uint32_t cid = 0;
+        uint64_t csz = 0;
+        bool unk = false;
+        if (!read_ebml_id(hdr_peek, p, cid) || cid != expected_id ||
+            !read_ebml_size(hdr_peek, p, csz, unk) || unk || csz == 0 || csz > cap) {
+            return;
+        }
+        if (p > file_size - offset || csz > (file_size - offset) - p) {
+            return;
+        }
+        std::vector<uint8_t> payload;
+        if (read_file_slice(ifs, offset + p, static_cast<size_t>(csz), payload) &&
+            payload.size() == csz) {
+            dispatch_top_element(cid, payload);
+        }
+    };
+
+    if (!got_info && has_seek_info) {
+        read_element_at(0x1549A966U, seek_info_off, kMaxMetaSectionBytes);
+    }
+    if (!got_tracks && has_seek_tracks) {
+        read_element_at(0x1654AE6BU, seek_tracks_off, kMaxMetaSectionBytes);
+    }
+    if (!got_attachments && has_seek_att) {
+        read_element_at(0x1941A469U, seek_att_off, kMaxCoverPayloadBytes + 4096);
+    }
+
+    // Only allow skipping libmpv track-list inspection when Tracks was actually parsed
+    // and confirmed a single video stream without embedded cover art.
+    if ((!got_tracks || mkv_video_tracks != 1) && !res.has_embedded_cover) {
+        res.parsed = false;
+    }
+
+    return res;
+}
+
+constexpr uint32_t fourcc(char a, char b, char c, char d) noexcept {
+    return (static_cast<uint32_t>(static_cast<uint8_t>(a)) << 24) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 8) |
+           static_cast<uint32_t>(static_cast<uint8_t>(d));
+}
+
+struct Mp4BoxHeader {
+    uint32_t type{0};
+    uint64_t header_size{0};
+    uint64_t box_size{0};
+};
+
+bool read_mp4_box_header(
+    std::ifstream& ifs,
+    uint64_t offset,
+    uint64_t limit,
+    Mp4BoxHeader& out)
+{
+    if (offset > limit || limit - offset < 8) return false;
+    uint8_t buf[16];
+    ifs.clear();
+    ifs.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    const size_t to_read = (limit - offset >= 16) ? 16 : 8;
+    ifs.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(to_read));
+    if (ifs.gcount() < 8) return false;
+
+    const uint32_t sz32 = read_be32(buf);
+    const uint32_t type = read_be32(buf + 4);
+    uint64_t hdr_sz = 8;
+    uint64_t full_sz = sz32;
+    if (sz32 == 1) {
+        if (ifs.gcount() < 16) return false;
+        full_sz = read_be64(buf + 8);
+        hdr_sz = 16;
+    } else if (sz32 == 0) {
+        full_sz = limit - offset;
+    }
+    if (full_sz < hdr_sz || full_sz > limit - offset) return false;
+    out = Mp4BoxHeader{type, hdr_sz, full_sz};
+    return true;
+}
+
+void parse_mp4_meta_box(
+    std::ifstream& ifs,
+    uint64_t meta_payload_off,
+    uint64_t meta_payload_end,
+    ContainerProbeResult& res)
+{
+    // `meta` is normally a FullBox (4 bytes version/flags), though some muxers omit it
+    uint64_t start = meta_payload_off;
+    Mp4BoxHeader probe{};
+    if (start <= meta_payload_end && meta_payload_end - start >= 4 &&
+        read_mp4_box_header(ifs, start + 4, meta_payload_end, probe) &&
+        (probe.type == fourcc('h', 'd', 'l', 'r') || probe.type == fourcc('i', 'l', 's', 't'))) {
+        start += 4;
+    }
+
+    uint64_t pos = start;
+    int iters = 0;
+    while (pos <= meta_payload_end && meta_payload_end - pos >= 8 && ++iters < 128) {
+        Mp4BoxHeader child{};
+        if (!read_mp4_box_header(ifs, pos, meta_payload_end, child)) break;
+        if (child.type == fourcc('i', 'l', 's', 't')) {
+            uint64_t ipos = pos + child.header_size;
+            const uint64_t iend = pos + child.box_size;
+            int iiters = 0;
+            while (ipos <= iend && iend - ipos >= 8 && ++iiters < 256) {
+                Mp4BoxHeader item{};
+                if (!read_mp4_box_header(ifs, ipos, iend, item)) break;
+                if (item.type == fourcc('c', 'o', 'v', 'r')) {
+                    uint64_t cpos = ipos + item.header_size;
+                    const uint64_t cend = ipos + item.box_size;
+                    int citers = 0;
+                    while (cpos <= cend && cend - cpos >= 8 && ++citers < 32) {
+                        Mp4BoxHeader dbox{};
+                        if (!read_mp4_box_header(ifs, cpos, cend, dbox)) break;
+                        const uint64_t data_hdr = dbox.header_size + 8; // type(4) + locale(4)
+                        if (dbox.type == fourcc('d', 'a', 't', 'a') && dbox.box_size > data_hdr) {
+                            const uint64_t img_sz = dbox.box_size - data_hdr;
+                            if (img_sz <= kMaxCoverPayloadBytes) {
+                                std::vector<uint8_t> img_bytes;
+                                if (read_file_slice(ifs, cpos + data_hdr, static_cast<size_t>(img_sz), img_bytes) &&
+                                    img_bytes.size() == img_sz) {
+                                    std::string fmt = sniff_image_format(img_bytes);
+                                    if (!fmt.empty()) {
+                                        res.has_embedded_cover = true;
+                                        res.cover_format = std::move(fmt);
+                                        res.cover_data = std::move(img_bytes);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        cpos += dbox.box_size;
+                    }
+                }
+                ipos += item.box_size;
+            }
+        }
+        pos += child.box_size;
+    }
+}
+
+[[nodiscard]] ContainerProbeResult probe_isobmff_container(
+    std::ifstream& ifs,
+    uint64_t file_size)
+{
+    ContainerProbeResult res;
+    uint64_t pos = 0;
+    uint64_t moov_off = 0;
+    uint64_t moov_sz = 0;
+    bool has_moov = false;
+
+    int top_iters = 0;
+    while (pos <= file_size && file_size - pos >= 8 && ++top_iters < 256) {
+        Mp4BoxHeader box{};
+        if (!read_mp4_box_header(ifs, pos, file_size, box)) break;
+        if (box.type == fourcc('m', 'o', 'o', 'v')) {
+            moov_off = pos + box.header_size;
+            moov_sz = box.box_size - box.header_size;
+            has_moov = true;
+            break;
+        }
+        pos += box.box_size;
+    }
+
+    if (!has_moov) {
+        return res;
+    }
+    res.parsed = true;
+
+    const uint64_t moov_end = moov_off + moov_sz;
+    uint64_t mpos = moov_off;
+    int miters = 0;
+    int vide_track_count = 0;
+    while (mpos <= moov_end && moov_end - mpos >= 8 && ++miters < 512) {
+        Mp4BoxHeader child{};
+        if (!read_mp4_box_header(ifs, mpos, moov_end, child)) break;
+        const uint64_t cstart = mpos + child.header_size;
+        const uint64_t cend = mpos + child.box_size;
+
+        if (child.type == fourcc('m', 'v', 'h', 'd')) {
+            std::vector<uint8_t> mv;
+            if (read_file_slice(ifs, cstart, std::min<size_t>(128, static_cast<size_t>(cend - cstart)), mv) &&
+                mv.size() >= 20) {
+                const uint8_t version = mv[0];
+                if (version == 0 && mv.size() >= 20) {
+                    const uint32_t ts = read_be32(mv.data() + 12);
+                    const uint32_t dur = read_be32(mv.data() + 16);
+                    if (ts > 0 && dur > 0) {
+                        res.duration_sec = static_cast<double>(dur) / static_cast<double>(ts);
+                    }
+                } else if (version == 1 && mv.size() >= 32) {
+                    const uint32_t ts = read_be32(mv.data() + 20);
+                    const uint64_t dur = read_be64(mv.data() + 24);
+                    if (ts > 0 && dur > 0) {
+                        res.duration_sec = static_cast<double>(dur) / static_cast<double>(ts);
+                    }
+                }
+            }
+        } else if (child.type == fourcc('t', 'r', 'a', 'k')) {
+            uint64_t tpos = cstart;
+            int titers = 0;
+            uint32_t tkhd_w = 0;
+            uint32_t tkhd_h = 0;
+            bool is_vide = false;
+            while (tpos + 8 <= cend && ++titers < 64) {
+                Mp4BoxHeader tb{};
+                if (!read_mp4_box_header(ifs, tpos, cend, tb)) break;
+                const uint64_t tb_start = tpos + tb.header_size;
+                const uint64_t tb_end = tpos + tb.box_size;
+                if (tb.type == fourcc('t', 'k', 'h', 'd')) {
+                    std::vector<uint8_t> tk;
+                    if (read_file_slice(ifs, tb_start, std::min<size_t>(128, static_cast<size_t>(tb_end - tb_start)), tk) &&
+                        !tk.empty()) {
+                        const uint8_t ver = tk[0];
+                        if (ver == 0 && tk.size() >= 84) {
+                            tkhd_w = read_be32(tk.data() + 76) >> 16;
+                            tkhd_h = read_be32(tk.data() + 80) >> 16;
+                        } else if (ver == 1 && tk.size() >= 96) {
+                            tkhd_w = read_be32(tk.data() + 88) >> 16;
+                            tkhd_h = read_be32(tk.data() + 92) >> 16;
+                        }
+                    }
+                } else if (tb.type == fourcc('m', 'd', 'i', 'a')) {
+                    uint64_t mdpos = tb_start;
+                    int mditers = 0;
+                    while (mdpos + 8 <= tb_end && ++mditers < 32) {
+                        Mp4BoxHeader mb{};
+                        if (!read_mp4_box_header(ifs, mdpos, tb_end, mb)) break;
+                        if (mb.type == fourcc('h', 'd', 'l', 'r')) {
+                            std::vector<uint8_t> hd;
+                            if (read_file_slice(ifs, mdpos + mb.header_size, 16, hd) && hd.size() >= 12) {
+                                if (read_be32(hd.data() + 8) == fourcc('v', 'i', 'd', 'e')) {
+                                    is_vide = true;
+                                }
+                            }
+                            break;
+                        }
+                        mdpos += mb.box_size;
+                    }
+                }
+                tpos += tb.box_size;
+            }
+            if (is_vide) {
+                ++vide_track_count;
+                if ((res.width == 0 || res.height == 0) && tkhd_w > 0 && tkhd_h > 0) {
+                    res.width = tkhd_w;
+                    res.height = tkhd_h;
+                }
+            }
+        } else if (child.type == fourcc('u', 'd', 't', 'a') && !res.has_embedded_cover) {
+            uint64_t upos = cstart;
+            int uiters = 0;
+            while (upos + 8 <= cend && ++uiters < 64) {
+                Mp4BoxHeader ub{};
+                if (!read_mp4_box_header(ifs, upos, cend, ub)) break;
+                if (ub.type == fourcc('m', 'e', 't', 'a')) {
+                    parse_mp4_meta_box(ifs, upos + ub.header_size, upos + ub.box_size, res);
+                    if (res.has_embedded_cover) break;
+                }
+                upos += ub.box_size;
+            }
+        } else if (child.type == fourcc('m', 'e', 't', 'a') && !res.has_embedded_cover) {
+            parse_mp4_meta_box(ifs, cstart, cend, res);
+        }
+
+        mpos += child.box_size;
+    }
+
+    // Multiple (or zero) video tracks without an explicit `covr` atom may contain an
+    // `attached_pic` track; let libmpv's track-list inspector handle those rather than skipping Load #1.
+    if (vide_track_count != 1 && !res.has_embedded_cover) {
+        res.parsed = false;
+    }
+
+    return res;
+}
+
+[[nodiscard]] std::optional<slint::SharedPixelBuffer<slint::Rgba8Pixel>> try_load_sidecar_cover(
+    const std::filesystem::path& video_path)
+{
+    static constexpr std::array<std::string_view, 4> kExts = {".webp", ".jpg", ".jpeg", ".png"};
+    const std::filesystem::path parent = video_path.parent_path();
+    const std::string stem = video_path.stem().string();
+    if (stem.empty()) return std::nullopt;
+
+    for (std::string_view ext : kExts) {
+        const std::filesystem::path candidate = parent / (stem + std::string(ext));
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec)) continue;
+        const uint64_t fsz = std::filesystem::file_size(candidate, ec);
+        if (ec || fsz == 0 || fsz > kMaxCoverPayloadBytes) continue;
+
+        std::ifstream ifs(candidate, std::ios::binary);
+        if (!ifs) continue;
+        std::vector<uint8_t> bytes(static_cast<size_t>(fsz));
+        ifs.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(fsz));
+        if (!ifs || static_cast<uint64_t>(ifs.gcount()) != fsz) continue;
+
+        std::string_view fmt = ext.substr(1);
+        if (fmt == "jpeg") fmt = "jpg";
+        if (auto pix = decode_and_resize_cover_image(bytes, fmt)) {
+            return pix;
+        }
+    }
+    return std::nullopt;
+}
+
+// Persistent thread-local libmpv software thumbnail extractor (Tier-2 10% frame fallback)
 struct ThreadLocalThumbExtractor {
     mpv_handle* mpv{nullptr};
     mpv_render_context* rctx{nullptr};
+
+    static void on_render_update(void* ctx) noexcept {
+        auto* self = static_cast<ThreadLocalThumbExtractor*>(ctx);
+        if (self && self->mpv) {
+            mpv_wakeup(self->mpv);
+        }
+    }
 
     ~ThreadLocalThumbExtractor() {
         shutdown();
@@ -228,17 +985,30 @@ struct ThreadLocalThumbExtractor {
 
         mpv_set_option_string(mpv, "vo", "libmpv");
         mpv_set_option_string(mpv, "ao", "null");
-        mpv_set_option_string(mpv, "vid", "1");
+        mpv_set_option_string(mpv, "vid", "auto");
         mpv_set_option_string(mpv, "aid", "no");
         mpv_set_option_string(mpv, "sid", "no");
-        mpv_set_option_string(mpv, "hwdec", "auto-safe");
+        // Software render context (MPV_RENDER_API_TYPE_SW) always reads CPU frames;
+        // disabling hwdec, Lua scripts, OSD, and autoloading minimizes per-file overhead.
+        mpv_set_option_string(mpv, "hwdec", "no");
+        mpv_set_option_string(mpv, "load-scripts", "no");
+        mpv_set_option_string(mpv, "osc", "no");
+        mpv_set_option_string(mpv, "osd-level", "0");
+        mpv_set_option_string(mpv, "sub-auto", "no");
+        mpv_set_option_string(mpv, "audio-file-auto", "no");
+        mpv_set_option_string(mpv, "autoload-files", "no");
+        mpv_set_option_string(mpv, "vd-lavc-threads", "2");
         mpv_set_option_string(mpv, "hr-seek", "no");
         mpv_set_option_string(mpv, "vd-lavc-fast", "yes");
         mpv_set_option_string(mpv, "vd-lavc-skiploopfilter", "all");
         mpv_set_option_string(mpv, "demuxer-readahead-secs", "0");
         mpv_set_option_string(mpv, "cache", "no");
         mpv_set_option_string(mpv, "pause", "yes");
+        mpv_set_option_string(mpv, "keep-open", "yes");
+        mpv_set_option_string(mpv, "image-display-duration", "inf");
+        mpv_set_option_string(mpv, "video-timing-offset", "0");
         mpv_set_option_string(mpv, "quiet", "yes");
+        mpv_set_option_string(mpv, "msg-level", "all=no");
         mpv_set_option_string(mpv, "terminal", "no");
 
         if (mpv_initialize(mpv) < 0) {
@@ -255,11 +1025,13 @@ struct ThreadLocalThumbExtractor {
             shutdown();
             return false;
         }
+        mpv_render_context_set_update_callback(rctx, on_render_update, this);
         return true;
     }
 
     void shutdown() {
         if (rctx) {
+            mpv_render_context_set_update_callback(rctx, nullptr, nullptr);
             mpv_render_context_free(rctx);
             rctx = nullptr;
         }
@@ -269,8 +1041,183 @@ struct ThreadLocalThumbExtractor {
         }
     }
 
+    void drain_events() {
+        while (true) {
+            mpv_event* ev = mpv_wait_event(mpv, 0.0);
+            if (!ev || ev->event_id == MPV_EVENT_NONE) break;
+        }
+        if (rctx) {
+            (void)mpv_render_context_update(rctx);
+        }
+    }
+
+    void stop_and_wait_idle() {
+        if (!mpv) return;
+        const char* stop_cmd[] = {"stop", nullptr};
+        (void)mpv_command(mpv, stop_cmd);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < deadline) {
+            int idle = 0;
+            if (mpv_get_property(mpv, "idle-active", MPV_FORMAT_FLAG, &idle) >= 0 && idle != 0) {
+                break;
+            }
+            mpv_event* ev = mpv_wait_event(mpv, 0.01);
+            if (ev && ev->event_id == MPV_EVENT_IDLE) {
+                break;
+            }
+        }
+        drain_events();
+    }
+
+    bool load_and_wait(
+        const std::string& path,
+        const char* per_file_options,
+        const std::stop_token& stop,
+        const std::atomic<uint64_t>& nav_epoch,
+        uint64_t job_epoch)
+    {
+        stop_and_wait_idle();
+        int rc = -1;
+        if (per_file_options && per_file_options[0] != '\0') {
+            const char* cmd_opts[] = {"loadfile", path.c_str(), "replace", "-1", per_file_options, nullptr};
+            rc = mpv_command(mpv, cmd_opts);
+            if (rc < 0) {
+                const char* cmd_opts_legacy[] = {"loadfile", path.c_str(), "replace", per_file_options, nullptr};
+                rc = mpv_command(mpv, cmd_opts_legacy);
+            }
+        } else {
+            const char* cmd_plain[] = {"loadfile", path.c_str(), "replace", nullptr};
+            rc = mpv_command(mpv, cmd_plain);
+        }
+        if (rc < 0) {
+            return false;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        bool started = false;
+        bool loaded = false;
+        bool restarted = false;
+
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+            if (nav_epoch.load(std::memory_order_relaxed) != job_epoch) {
+                stop_and_wait_idle();
+                return false;
+            }
+            mpv_event* ev = mpv_wait_event(mpv, 0.02);
+            if (!ev) continue;
+
+            if (!started) {
+                if (ev->event_id == MPV_EVENT_START_FILE) {
+                    started = true;
+                    loaded = false;
+                    restarted = false;
+                    if (rctx) {
+                        (void)mpv_render_context_update(rctx);
+                    }
+                }
+                continue;
+            }
+
+            if (ev->event_id == MPV_EVENT_FILE_LOADED) {
+                loaded = true;
+            } else if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
+                if (rctx) {
+                    (void)mpv_render_context_update(rctx);
+                }
+                restarted = true;
+            } else if (ev->event_id == MPV_EVENT_END_FILE) {
+                auto* end_ev = static_cast<mpv_event_end_file*>(ev->data);
+                if (!end_ev || end_ev->reason != MPV_END_FILE_REASON_EOF) {
+                    return false;
+                }
+                return loaded;
+            }
+
+            if (loaded && restarted) {
+                return true;
+            }
+        }
+        return loaded && restarted;
+    }
+
+    bool seek_percent_in_place(
+        const std::stop_token& stop,
+        const std::atomic<uint64_t>& nav_epoch,
+        uint64_t job_epoch)
+    {
+        drain_events();
+        const char* seek_cmd[] = {"seek", "10", "absolute-percent", "keyframes", nullptr};
+        if (mpv_command(mpv, seek_cmd) < 0) {
+            return false;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+            if (nav_epoch.load(std::memory_order_relaxed) != job_epoch) {
+                return false;
+            }
+            mpv_event* ev = mpv_wait_event(mpv, 0.02);
+            if (!ev) continue;
+            if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
+                if (rctx) {
+                    (void)mpv_render_context_update(rctx);
+                }
+                return true;
+            }
+            if (ev->event_id == MPV_EVENT_END_FILE) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool render_current_frame(slint::SharedPixelBuffer<slint::Rgba8Pixel>& out_pixels) {
+        if (rctx) {
+            (void)mpv_render_context_update(rctx);
+        }
+        slint::SharedPixelBuffer<slint::Rgba8Pixel> buffer(kThumbnailWidth, kThumbnailHeight);
+        int size[2] = {static_cast<int>(kThumbnailWidth), static_cast<int>(kThumbnailHeight)};
+        char format[] = "rgb0";
+        size_t stride = static_cast<size_t>(kThumbnailWidth) * 4;
+        int block_for_target_time = 0;
+        mpv_render_param rparams[] = {
+            {MPV_RENDER_PARAM_SW_SIZE, size},
+            {MPV_RENDER_PARAM_SW_FORMAT, format},
+            {MPV_RENDER_PARAM_SW_STRIDE, &stride},
+            {MPV_RENDER_PARAM_SW_POINTER, buffer.begin()},
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
+            {MPV_RENDER_PARAM_INVALID, nullptr},
+        };
+        if (mpv_render_context_render(rctx, rparams) < 0) {
+            return false;
+        }
+        auto* px = buffer.begin();
+        const size_t total = static_cast<size_t>(kThumbnailWidth) * static_cast<size_t>(kThumbnailHeight);
+        for (size_t i = 0; i < total; ++i) {
+            px[i].a = 255;
+        }
+        out_pixels = std::move(buffer);
+        return true;
+    }
+
+    void read_mpv_dimensions(uint32_t& out_width, uint32_t& out_height) const {
+        if (out_width == 0) {
+            int64_t vw = 0;
+            if (mpv_get_property(mpv, "width", MPV_FORMAT_INT64, &vw) >= 0 && vw > 0) {
+                out_width = static_cast<uint32_t>(vw);
+            }
+        }
+        if (out_height == 0) {
+            int64_t vh = 0;
+            if (mpv_get_property(mpv, "height", MPV_FORMAT_INT64, &vh) >= 0 && vh > 0) {
+                out_height = static_cast<uint32_t>(vh);
+            }
+        }
+    }
+
     bool extract(
         const std::string& path,
+        bool skip_probe_if_parsed,
+        double known_duration,
         const std::stop_token& stop,
         const std::atomic<uint64_t>& nav_epoch,
         uint64_t job_epoch,
@@ -281,52 +1228,29 @@ struct ThreadLocalThumbExtractor {
     {
         if (!ensure_init()) return false;
 
-        // Drain stale events
-        while (true) {
-            mpv_event* ev = mpv_wait_event(mpv, 0.0);
-            if (!ev || ev->event_id == MPV_EVENT_NONE) break;
-        }
-
-        const char* cmd[] = {"loadfile", path.c_str(), "replace", nullptr, "start=10%", nullptr};
-        // libmpv v2.5 loadfile takes (url, flags, index, options) or 3-arg (url, flags, options)
-        // Use 3-arg form with per-file option string "start=10%"
-        const char* cmd_load[] = {"loadfile", path.c_str(), "replace", "start=10%", nullptr};
-        (void)cmd;
-        if (mpv_command(mpv, cmd_load) < 0) {
-            return false;
-        }
-
-        bool loaded = false;
-        bool restarted = false;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-
-        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
-            if (nav_epoch.load(std::memory_order_relaxed) != job_epoch) {
-                const char* stop_cmd[] = {"stop", nullptr};
-                mpv_command_async(mpv, 0, stop_cmd);
-                return false;
-            }
-            mpv_event* ev = mpv_wait_event(mpv, 0.02);
-            if (!ev) continue;
-            if (ev->event_id == MPV_EVENT_FILE_LOADED) {
-                loaded = true;
-            } else if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
-                restarted = true;
-            } else if (ev->event_id == MPV_EVENT_END_FILE) {
-                auto* end_ev = static_cast<mpv_event_end_file*>(ev->data);
-                if (end_ev && end_ev->reason == MPV_END_FILE_REASON_ERROR) {
-                    return false;
+        // Fast single-pass path: container header probe already confirmed no embedded
+        // cover exists and extracted duration/dimensions, so jump straight to 10%!
+        if (skip_probe_if_parsed) {
+            const char* opts = (known_duration > 0.0) ? "vid=1,start=10%" : "vid=1";
+            bool ok = load_and_wait(path, opts, stop, nav_epoch, job_epoch);
+            if (ok) {
+                double dur = 0.0;
+                if (mpv_get_property(mpv, "duration", MPV_FORMAT_DOUBLE, &dur) >= 0 && dur > 0.0) {
+                    out_duration_sec = dur;
+                    if (known_duration <= 0.0) {
+                        (void)seek_percent_in_place(stop, nav_epoch, job_epoch);
+                    }
                 }
-                break;
+                read_mpv_dimensions(out_width, out_height);
+                ok = render_current_frame(out_pixels);
             }
-            if (loaded && restarted) {
-                break;
-            }
+            stop_and_wait_idle();
+            return ok;
         }
 
-        if (!loaded) {
-            const char* stop_cmd[] = {"stop", nullptr};
-            mpv_command_async(mpv, 0, stop_cmd);
+        // Fallback path for containers without a fast header probe (.avi, .flv, .ts, .wmv)
+        if (!load_and_wait(path, "vid=auto", stop, nav_epoch, job_epoch)) {
+            stop_and_wait_idle();
             return false;
         }
 
@@ -334,46 +1258,77 @@ struct ThreadLocalThumbExtractor {
         if (mpv_get_property(mpv, "duration", MPV_FORMAT_DOUBLE, &dur) >= 0 && dur > 0.0) {
             out_duration_sec = dur;
         }
-        int64_t vw = 0;
-        int64_t vh = 0;
-        if (mpv_get_property(mpv, "width", MPV_FORMAT_INT64, &vw) >= 0 && vw > 0) {
-            out_width = static_cast<uint32_t>(vw);
-        }
-        if (mpv_get_property(mpv, "height", MPV_FORMAT_INT64, &vh) >= 0 && vh > 0) {
-            out_height = static_cast<uint32_t>(vh);
+
+        VideoTrackProbeResult track_probe;
+        mpv_node track_list_node{};
+        if (mpv_get_property(mpv, "track-list", MPV_FORMAT_NODE, &track_list_node) >= 0) {
+            track_probe = inspect_track_list_for_thumbnail(track_list_node);
+            mpv_free_node_contents(&track_list_node);
         }
 
-        slint::SharedPixelBuffer<slint::Rgba8Pixel> buffer(kThumbnailWidth, kThumbnailHeight);
-        int size[2] = {static_cast<int>(kThumbnailWidth), static_cast<int>(kThumbnailHeight)};
-        char format[] = "rgba";
-        size_t stride = static_cast<size_t>(kThumbnailWidth) * 4;
-        mpv_render_param rparams[] = {
-            {MPV_RENDER_PARAM_SW_SIZE, size},
-            {MPV_RENDER_PARAM_SW_FORMAT, format},
-            {MPV_RENDER_PARAM_SW_STRIDE, &stride},
-            {MPV_RENDER_PARAM_SW_POINTER, buffer.begin()},
-            {MPV_RENDER_PARAM_INVALID, nullptr},
-        };
-
-        const int rerr = mpv_render_context_render(rctx, rparams);
-        const char* stop_cmd[] = {"stop", nullptr};
-        mpv_command_async(mpv, 0, stop_cmd);
-
-        if (rerr < 0) {
-            return false;
+        if (track_probe.primary_width > 0 && track_probe.primary_height > 0) {
+            out_width = track_probe.primary_width;
+            out_height = track_probe.primary_height;
+        } else {
+            read_mpv_dimensions(out_width, out_height);
         }
-        out_pixels = std::move(buffer);
-        return true;
+
+        bool rendered = false;
+
+        // Priority 1: Embedded thumbnail track in track-list
+        if (track_probe.embedded_thumb_vid > 0) {
+            bool thumb_ready = (track_probe.selected_vid == track_probe.embedded_thumb_vid);
+            if (!thumb_ready) {
+                const std::string vid_opt = std::format("vid={}", track_probe.embedded_thumb_vid);
+                thumb_ready = load_and_wait(path, vid_opt.c_str(), stop, nav_epoch, job_epoch);
+            }
+            if (thumb_ready) {
+                rendered = render_current_frame(out_pixels);
+            }
+        }
+
+        // Priority 2 (Fallback): Seek to 10% in-place on primary video track (or reload if vid was switched)
+        if (!rendered && !stop.stop_requested() &&
+            nav_epoch.load(std::memory_order_relaxed) == job_epoch) {
+            const int target_vid = track_probe.primary_video_vid > 0 ? track_probe.primary_video_vid : 1;
+            const bool already_on_primary =
+                (track_probe.embedded_thumb_vid <= 0) &&
+                (track_probe.selected_vid == target_vid);
+
+            if (already_on_primary) {
+                if (out_duration_sec > 0.0) {
+                    (void)seek_percent_in_place(stop, nav_epoch, job_epoch);
+                }
+                rendered = render_current_frame(out_pixels);
+            } else {
+                const std::string fallback_opts = (out_duration_sec > 0.0)
+                    ? std::format("vid={},start=10%", target_vid)
+                    : std::format("vid={}", target_vid);
+                if (load_and_wait(path, fallback_opts.c_str(), stop, nav_epoch, job_epoch)) {
+                    rendered = render_current_frame(out_pixels);
+                }
+            }
+        }
+
+        stop_and_wait_idle();
+        return rendered;
     }
 };
 
-[[nodiscard]] bool extract_thumb_ffmpeg_fallback(
-    const std::string& path,
+[[nodiscard]] bool run_ffmpeg_raw_rgba(
+    char* const argv[],
+    const std::stop_token& stop,
+    const std::atomic<uint64_t>& nav_epoch,
+    uint64_t job_epoch,
     slint::SharedPixelBuffer<slint::Rgba8Pixel>& out_pixels)
 {
     int pipefd[2]{-1, -1};
     if (pipe2(pipefd, O_CLOEXEC) != 0) {
         return false;
+    }
+    const int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
     }
 
     posix_spawn_file_actions_t actions;
@@ -383,34 +1338,12 @@ struct ThreadLocalThumbExtractor {
     posix_spawn_file_actions_addclose(&actions, pipefd[0]);
     posix_spawn_file_actions_addclose(&actions, pipefd[1]);
 
-    char arg0[] = "ffmpeg";
-    char arg1[] = "-nostdin";
-    char arg2[] = "-v";
-    char arg3[] = "error";
-    char arg4[] = "-ss";
-    char arg5[] = "5";
-    char arg6[] = "-i";
-    std::string path_copy = path;
-    char arg8[] = "-frames:v";
-    char arg9[] = "1";
-    char arg10[] = "-vf";
-    char arg11[] = "scale=320:180:force_original_aspect_ratio=increase,crop=320:180";
-    char arg12[] = "-f";
-    char arg13[] = "rawvideo";
-    char arg14[] = "-pix_fmt";
-    char arg15[] = "rgba";
-    char arg16[] = "-";
-    char* argv[] = {
-        arg0, arg1, arg2, arg3, arg4, arg5, arg6, path_copy.data(),
-        arg8, arg9, arg10, arg11, arg12, arg13, arg14, arg15, arg16, nullptr
-    };
-
     pid_t pid = -1;
     const int spawn_res = posix_spawnp(&pid, "ffmpeg", &actions, nullptr, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(pipefd[1]);
 
-    if (spawn_res != 0) {
+    if (spawn_res != 0 || pid <= 0) {
         close(pipefd[0]);
         return false;
     }
@@ -419,21 +1352,115 @@ struct ThreadLocalThumbExtractor {
     auto* dst = reinterpret_cast<uint8_t*>(buffer.begin());
     const size_t expected = static_cast<size_t>(kThumbnailWidth) * kThumbnailHeight * 4;
     size_t total = 0;
+    bool aborted = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+
     while (total < expected) {
+        if (stop.stop_requested() || nav_epoch.load(std::memory_order_relaxed) != job_epoch ||
+            std::chrono::steady_clock::now() >= deadline) {
+            aborted = true;
+            break;
+        }
+        pollfd pfd{pipefd[0], POLLIN, 0};
+        const int pr = poll(&pfd, 1, 50);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
         const ssize_t n = read(pipefd[0], dst + total, expected - total);
-        if (n <= 0) break;
-        total += static_cast<size_t>(n);
+        if (n > 0) {
+            total += static_cast<size_t>(n);
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        }
     }
     close(pipefd[0]);
 
-    int status = 0;
-    waitpid(pid, &status, 0);
+    if (aborted) {
+        (void)kill(pid, SIGKILL);
+    }
 
-    if (total == expected && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    int status = 0;
+    pid_t wres = 0;
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (true) {
+        wres = waitpid(pid, &status, WNOHANG);
+        if (wres == pid || (wres < 0 && errno != EINTR)) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= wait_deadline) {
+            (void)kill(pid, SIGKILL);
+            do {
+                wres = waitpid(pid, &status, 0);
+            } while (wres < 0 && errno == EINTR);
+            break;
+        }
+        poll(nullptr, 0, 10);
+    }
+
+    if (!aborted && total == expected && wres == pid &&
+        WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         out_pixels = std::move(buffer);
         return true;
     }
     return false;
+}
+
+[[nodiscard]] bool extract_thumb_ffmpeg_fallback(
+    const std::string& path,
+    double duration_sec,
+    const std::stop_token& stop,
+    const std::atomic<uint64_t>& nav_epoch,
+    uint64_t job_epoch,
+    slint::SharedPixelBuffer<slint::Rgba8Pixel>& out_pixels)
+{
+    std::string path_copy = path;
+    char arg_ffmpeg[] = "ffmpeg";
+    char arg_nostdin[] = "-nostdin";
+    char arg_v[] = "-v";
+    char arg_error[] = "error";
+    char arg_i[] = "-i";
+    char arg_frames[] = "-frames:v";
+    char arg_one[] = "1";
+    char arg_vf[] = "-vf";
+    char arg_scale[] = "scale=320:180:force_original_aspect_ratio=increase,crop=320:180";
+    char arg_f[] = "-f";
+    char arg_rawvideo[] = "rawvideo";
+    char arg_pix_fmt[] = "-pix_fmt";
+    char arg_rgba[] = "rgba";
+    char arg_stdout[] = "-";
+
+    // Seek to 10% of duration (or 1s, then frame 0 if duration is short/unknown)
+    const double seek_sec = (duration_sec > 0.0) ? (duration_sec * 0.10) : 1.0;
+    std::string seek_str = std::format("{:.2f}", seek_sec);
+    char arg_ss[] = "-ss";
+    char* argv_fallback[] = {
+        arg_ffmpeg, arg_nostdin, arg_v, arg_error,
+        arg_ss, seek_str.data(),
+        arg_i, path_copy.data(),
+        arg_frames, arg_one,
+        arg_vf, arg_scale,
+        arg_f, arg_rawvideo,
+        arg_pix_fmt, arg_rgba,
+        arg_stdout, nullptr
+    };
+    if (run_ffmpeg_raw_rgba(argv_fallback, stop, nav_epoch, job_epoch, out_pixels)) {
+        return true;
+    }
+    char* argv_frame0[] = {
+        arg_ffmpeg, arg_nostdin, arg_v, arg_error,
+        arg_i, path_copy.data(),
+        arg_frames, arg_one,
+        arg_vf, arg_scale,
+        arg_f, arg_rawvideo,
+        arg_pix_fmt, arg_rgba,
+        arg_stdout, nullptr
+    };
+    return run_ffmpeg_raw_rgba(argv_frame0, stop, nav_epoch, job_epoch, out_pixels);
 }
 
 [[nodiscard]] std::optional<std::string> run_native_dialog_blocking(
@@ -773,6 +1800,242 @@ std::string serialize_watch_history(const std::unordered_map<std::string, WatchH
     return out;
 }
 
+VideoTrackProbeResult inspect_track_list_for_thumbnail(const mpv_node& root) noexcept {
+    VideoTrackProbeResult res;
+    if (root.format != MPV_FORMAT_NODE_ARRAY || !root.u.list) {
+        return res;
+    }
+
+    const mpv_node_list* list = root.u.list;
+    for (int i = 0; i < list->num; ++i) {
+        const mpv_node& entry = list->values[i];
+        if (entry.format != MPV_FORMAT_NODE_MAP || !entry.u.list) {
+            continue;
+        }
+
+        const mpv_node_list* map = entry.u.list;
+        int id = -1;
+        bool is_video = false;
+        bool is_albumart = false;
+        bool is_image = false;
+        bool is_selected = false;
+        uint32_t w = 0;
+        uint32_t h = 0;
+
+        for (int k = 0; k < map->num; ++k) {
+            if (!map->keys || !map->keys[k]) continue;
+            std::string_view key(map->keys[k]);
+            const mpv_node& val = map->values[k];
+
+            if (key == "id" && val.format == MPV_FORMAT_INT64) {
+                id = static_cast<int>(val.u.int64);
+            } else if (key == "type" && val.format == MPV_FORMAT_STRING && val.u.string) {
+                is_video = (std::string_view(val.u.string) == "video");
+            } else if (key == "albumart" && val.format == MPV_FORMAT_FLAG) {
+                is_albumart = (val.u.flag != 0);
+            } else if (key == "image" && val.format == MPV_FORMAT_FLAG) {
+                is_image = (val.u.flag != 0);
+            } else if (key == "selected" && val.format == MPV_FORMAT_FLAG) {
+                is_selected = (val.u.flag != 0);
+            } else if (key == "demux-w" && val.format == MPV_FORMAT_INT64 && val.u.int64 > 0) {
+                w = static_cast<uint32_t>(val.u.int64);
+            } else if (key == "demux-h" && val.format == MPV_FORMAT_INT64 && val.u.int64 > 0) {
+                h = static_cast<uint32_t>(val.u.int64);
+            }
+        }
+
+        if (!is_video || id <= 0) {
+            continue;
+        }
+
+        if (is_selected && res.selected_vid < 0) {
+            res.selected_vid = id;
+        }
+
+        if (is_albumart || is_image) {
+            if (res.embedded_thumb_vid < 0) {
+                res.embedded_thumb_vid = id;
+            }
+        } else {
+            if (res.primary_video_vid < 0) {
+                res.primary_video_vid = id;
+                res.primary_width = w;
+                res.primary_height = h;
+            }
+        }
+    }
+
+    return res;
+}
+
+ContainerProbeResult probe_container_for_thumbnail(const std::filesystem::path& path) {
+    std::error_code ec;
+    const uint64_t fsz = std::filesystem::file_size(path, ec);
+    if (ec || fsz < 16) {
+        return {};
+    }
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        return {};
+    }
+
+    std::vector<uint8_t> hdr;
+    if (!read_file_slice(ifs, 0, static_cast<size_t>(std::min<uint64_t>(fsz, 65536)), hdr) ||
+        hdr.size() < 12) {
+        return {};
+    }
+
+    // Matroska / WebM EBML header magic
+    if (hdr[0] == 0x1A && hdr[1] == 0x45 && hdr[2] == 0xDF && hdr[3] == 0xA3) {
+        return probe_matroska_container(ifs, hdr, fsz);
+    }
+
+    // ISOBMFF (.mp4, .m4v, .mov) starts with a box header (e.g. ftyp / free / wide / moov)
+    const uint32_t box_type = read_be32(hdr.data() + 4);
+    if (box_type == fourcc('f', 't', 'y', 'p') || box_type == fourcc('m', 'o', 'o', 'v') ||
+        box_type == fourcc('f', 'r', 'e', 'e') || box_type == fourcc('w', 'i', 'd', 'e')) {
+        return probe_isobmff_container(ifs, fsz);
+    }
+
+    return {};
+}
+
+slint::SharedPixelBuffer<slint::Rgba8Pixel> resize_cover_rgba8(
+    const slint::SharedPixelBuffer<slint::Rgba8Pixel>& src,
+    uint32_t dst_w,
+    uint32_t dst_h)
+{
+    const uint32_t sw = src.width();
+    const uint32_t sh = src.height();
+    if (sw == 0 || sh == 0 || dst_w == 0 || dst_h == 0) {
+        return {};
+    }
+    if (sw == dst_w && sh == dst_h) {
+        return src;
+    }
+
+    slint::SharedPixelBuffer<slint::Rgba8Pixel> dst(dst_w, dst_h);
+    const auto* spx = src.begin();
+    auto* dpx = dst.begin();
+
+    // Compute centered aspect-fill (cover) crop window inside source image
+    const double src_aspect = static_cast<double>(sw) / static_cast<double>(sh);
+    const double dst_aspect = static_cast<double>(dst_w) / static_cast<double>(dst_h);
+    double crop_x = 0.0;
+    double crop_y = 0.0;
+    double crop_w = static_cast<double>(sw);
+    double crop_h = static_cast<double>(sh);
+
+    if (src_aspect > dst_aspect) {
+        crop_w = static_cast<double>(sh) * dst_aspect;
+        crop_x = (static_cast<double>(sw) - crop_w) * 0.5;
+    } else if (src_aspect < dst_aspect) {
+        crop_h = static_cast<double>(sw) / dst_aspect;
+        crop_y = (static_cast<double>(sh) - crop_h) * 0.5;
+    }
+
+    const double scale_x = crop_w / static_cast<double>(dst_w);
+    const double scale_y = crop_h / static_cast<double>(dst_h);
+
+    if (scale_x >= 1.0 && scale_y >= 1.0) {
+        // Area-averaging box downsample: crisp and free of aliasing
+        for (uint32_t dy = 0; dy < dst_h; ++dy) {
+            const uint32_t sy0 = static_cast<uint32_t>(std::clamp(crop_y + dy * scale_y, 0.0, static_cast<double>(sh - 1)));
+            uint32_t sy1 = static_cast<uint32_t>(std::clamp(std::ceil(crop_y + (dy + 1) * scale_y), 1.0, static_cast<double>(sh)));
+            if (sy1 <= sy0) sy1 = std::min(sh, sy0 + 1);
+            sy1 = std::min(sy1, sh);
+
+            for (uint32_t dx = 0; dx < dst_w; ++dx) {
+                const uint32_t sx0 = static_cast<uint32_t>(std::clamp(crop_x + dx * scale_x, 0.0, static_cast<double>(sw - 1)));
+                uint32_t sx1 = static_cast<uint32_t>(std::clamp(std::ceil(crop_x + (dx + 1) * scale_x), 1.0, static_cast<double>(sw)));
+                if (sx1 <= sx0) sx1 = std::min(sw, sx0 + 1);
+                sx1 = std::min(sx1, sw);
+
+                uint32_t sr = 0;
+                uint32_t sg = 0;
+                uint32_t sb = 0;
+                uint32_t sa = 0;
+                uint32_t count = 0;
+                for (uint32_t sy = sy0; sy < sy1; ++sy) {
+                    const size_t row_off = static_cast<size_t>(sy) * sw;
+                    for (uint32_t sx = sx0; sx < sx1; ++sx) {
+                        const auto& p = spx[row_off + sx];
+                        sr += p.r;
+                        sg += p.g;
+                        sb += p.b;
+                        sa += p.a;
+                        ++count;
+                    }
+                }
+                const uint32_t inv = count > 0 ? count : 1;
+                dpx[static_cast<size_t>(dy) * dst_w + dx] = slint::Rgba8Pixel{
+                    static_cast<uint8_t>(sr / inv),
+                    static_cast<uint8_t>(sg / inv),
+                    static_cast<uint8_t>(sb / inv),
+                    static_cast<uint8_t>(sa / inv),
+                };
+            }
+        }
+    } else {
+        // Bilinear upsample
+        for (uint32_t dy = 0; dy < dst_h; ++dy) {
+            const double fy = std::clamp(crop_y + (dy + 0.5) * scale_y - 0.5, 0.0, static_cast<double>(sh - 1));
+            const uint32_t y0 = static_cast<uint32_t>(fy);
+            const uint32_t y1 = std::min(y0 + 1, sh - 1);
+            const double wy = fy - static_cast<double>(y0);
+
+            for (uint32_t dx = 0; dx < dst_w; ++dx) {
+                const double fx = std::clamp(crop_x + (dx + 0.5) * scale_x - 0.5, 0.0, static_cast<double>(sw - 1));
+                const uint32_t x0 = static_cast<uint32_t>(fx);
+                const uint32_t x1 = std::min(x0 + 1, sw - 1);
+                const double wx = fx - static_cast<double>(x0);
+
+                const auto& p00 = spx[static_cast<size_t>(y0) * sw + x0];
+                const auto& p10 = spx[static_cast<size_t>(y0) * sw + x1];
+                const auto& p01 = spx[static_cast<size_t>(y1) * sw + x0];
+                const auto& p11 = spx[static_cast<size_t>(y1) * sw + x1];
+
+                auto lerp_ch = [&](uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11) -> uint8_t {
+                    const double top = c00 * (1.0 - wx) + c10 * wx;
+                    const double bot = c01 * (1.0 - wx) + c11 * wx;
+                    const double v = top * (1.0 - wy) + bot * wy;
+                    return static_cast<uint8_t>(std::clamp(v + 0.5, 0.0, 255.0));
+                };
+
+                dpx[static_cast<size_t>(dy) * dst_w + dx] = slint::Rgba8Pixel{
+                    lerp_ch(p00.r, p10.r, p01.r, p11.r),
+                    lerp_ch(p00.g, p10.g, p01.g, p11.g),
+                    lerp_ch(p00.b, p10.b, p01.b, p11.b),
+                    lerp_ch(p00.a, p10.a, p01.a, p11.a),
+                };
+            }
+        }
+    }
+
+    return dst;
+}
+
+std::optional<slint::SharedPixelBuffer<slint::Rgba8Pixel>> decode_and_resize_cover_image(
+    std::span<const uint8_t> encoded_bytes,
+    std::string_view format_hint)
+{
+    if (encoded_bytes.empty() || encoded_bytes.size() > kMaxCoverPayloadBytes) {
+        return std::nullopt;
+    }
+    std::string sniffed;
+    if (format_hint.empty()) {
+        sniffed = sniff_image_format(encoded_bytes);
+        format_hint = sniffed;
+    }
+    auto img = slint::Image::load_from_data(encoded_bytes, format_hint);
+    auto rgba = img.to_rgba8();
+    if (!rgba.has_value() || rgba->width() == 0 || rgba->height() == 0) {
+        return std::nullopt;
+    }
+    return resize_cover_rgba8(*rgba, kThumbnailWidth, kThumbnailHeight);
+}
+
 std::vector<MediaIndexRecord> read_media_index_file(const std::filesystem::path& path) {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) return {};
@@ -839,7 +2102,7 @@ std::optional<slint::SharedPixelBuffer<slint::Rgba8Pixel>> read_mpxt_thumbnail(
     MpxtHeader hdr{};
     ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (!ifs || hdr.magic != 0x5458504DU || hdr.width != kThumbnailWidth ||
-        hdr.height != kThumbnailHeight || hdr.format != 1) {
+        hdr.height != kThumbnailHeight || hdr.format != 4) {
         return std::nullopt;
     }
 
@@ -978,8 +2241,10 @@ void LibraryService::initialize(
 
     scanner_thread_ = std::jthread([this](std::stop_token st) { scanner_loop(st); });
     if (enable_thumb_workers) {
-        thumb_workers_.reserve(2);
-        for (int i = 0; i < 2; ++i) {
+        const size_t hw = std::thread::hardware_concurrency();
+        const size_t worker_count = std::clamp<size_t>(hw / 2, 2, 4);
+        thumb_workers_.reserve(worker_count);
+        for (size_t i = 0; i < worker_count; ++i) {
             thumb_workers_.emplace_back([this](std::stop_token st) { thumb_worker_loop(st); });
         }
     }
@@ -1836,24 +3101,69 @@ void LibraryService::thumb_worker_loop(std::stop_token stop) {
             pixels = read_mpxt_thumbnail(mpxt_path);
         }
 
-        // 3. Generate via thread-local libmpv SW render context (or ffmpeg fallback)
+        // 3. Fast 3-tier extraction:
+        //    Tier 1A: Zero-decoder EBML/ISOBMFF cover extraction + in-process image decode
+        //    Tier 1B: Adjacent sidecar cover image (<stem>.{webp,jpg,png})
+        //    Tier 2:  Single-pass libmpv 10% frame fallback (or ffmpeg fallback)
         if (!pixels.has_value()) {
             slint::SharedPixelBuffer<slint::Rgba8Pixel> gen_buf;
             uint32_t vw = 0;
             uint32_t vh = 0;
             double gen_dur = 0.0;
-            bool ok = extractor.extract(
-                job->path, stop, nav_epoch_, job->epoch, gen_dur, vw, vh, gen_buf);
+            bool ok = false;
+
+            const ContainerProbeResult probe = probe_container_for_thumbnail(job->path);
+            if (probe.duration_sec > 0.0) {
+                gen_dur = probe.duration_sec;
+                dur_sec = probe.duration_sec;
+            }
+            if (probe.width > 0 && probe.height > 0) {
+                vw = probe.width;
+                vh = probe.height;
+            }
+
+            if (probe.has_embedded_cover && !probe.cover_data.empty()) {
+                if (auto cov = decode_and_resize_cover_image(probe.cover_data, probe.cover_format)) {
+                    gen_buf = std::move(*cov);
+                    ok = true;
+                }
+            }
+
             if (!ok && !stop.stop_requested() &&
                 nav_epoch_.load(std::memory_order_relaxed) == job->epoch) {
-                ok = extract_thumb_ffmpeg_fallback(job->path, gen_buf);
+                if (auto sidecar = try_load_sidecar_cover(job->path)) {
+                    gen_buf = std::move(*sidecar);
+                    ok = true;
+                }
             }
-            if (ok) {
-                pixels = std::move(gen_buf);
-                (void)write_mpxt_thumbnail_atomic(mpxt_path, *pixels);
+
+            if (!ok && !stop.stop_requested() &&
+                nav_epoch_.load(std::memory_order_relaxed) == job->epoch) {
+                ok = extractor.extract(
+                    job->path,
+                    probe.parsed && !probe.has_embedded_cover,
+                    dur_sec,
+                    stop,
+                    nav_epoch_,
+                    job->epoch,
+                    gen_dur,
+                    vw,
+                    vh,
+                    gen_buf);
                 if (gen_dur > 0.0) {
                     dur_sec = gen_dur;
                 }
+            }
+
+            if (!ok && !stop.stop_requested() &&
+                nav_epoch_.load(std::memory_order_relaxed) == job->epoch) {
+                ok = extract_thumb_ffmpeg_fallback(
+                    job->path, dur_sec, stop, nav_epoch_, job->epoch, gen_buf);
+            }
+
+            if (ok) {
+                pixels = std::move(gen_buf);
+                (void)write_mpxt_thumbnail_atomic(mpxt_path, *pixels);
                 {
                     std::lock_guard lock(state_mutex_);
                     auto& rec = media_index_[job->cache_key];
