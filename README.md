@@ -88,3 +88,9 @@ ctest --preset dev-debug
 # Or open a media file or URL directly:
 ./build/dev-debug/mpvx "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 ```
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** (`GPL-3.0-or-later`) — see the [LICENSE](LICENSE) file (or <https://www.gnu.org/licenses/gpl-3.0.html>) for details.
