@@ -5,7 +5,9 @@
 #include "mpvx/renderer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <format>
@@ -281,6 +283,291 @@ private:
     std::unordered_map<uint64_t, slint::Image> cached_images_;
 };
 
+// Render-target state of the mini player (docs/mini-player-ui-spec.md §5.2).
+enum class RenderTargetMode : uint8_t { Full, FullToMini, Mini };
+
+// GUI-thread-only state machine for the mini player (docs/mini-player-ui-spec.md §5, §7.4).
+// Owns render-target sizing for both full and mini mode. All timers are slint::Timer
+// single-shots guarded by generation counters, so a stale timer can never act after a
+// later transition. No locks: every method runs on the GUI thread.
+class MiniPlayerController : public std::enable_shared_from_this<MiniPlayerController> {
+public:
+    MiniPlayerController(slint::ComponentWeakHandle<MainWindow> ui,
+                         std::shared_ptr<mpvx::Player> player,
+                         std::shared_ptr<mpvx::VideoRenderer> renderer,
+                         std::shared_ptr<mpvx::LibraryService> library,
+                         std::shared_ptr<std::string> active_media_path)
+        : ui_(std::move(ui))
+        , player_(std::move(player))
+        , renderer_(std::move(renderer))
+        , library_(std::move(library))
+        , active_media_path_(std::move(active_media_path))
+    {}
+
+    // --- Render-target sizing ---
+
+    void set_video_size(mpvx::VideoDisplaySize size) {
+        aspect_ = size.aspect();
+        if (auto ui = lock()) {
+            (*ui)->set_video_aspect(size.valid() ? static_cast<float>(aspect_) : 16.0f / 9.0f);
+        }
+        if (mode_ != RenderTargetMode::FullToMini) {
+            apply_target(); // never change the target while the shrink morph runs (§2.3 rule 4)
+        }
+    }
+
+    void on_window_resized() {
+        // Not during the shrink morph either (§2.3 rule 4): settle_shrink() and expand()
+        // recompute the target from the current geometry.
+        if (mode_ == RenderTargetMode::Full) apply_target();
+    }
+
+    void on_mini_geometry_changed() {
+        if (mode_ == RenderTargetMode::Mini) apply_target();
+    }
+
+    // --- Transitions ---
+
+    // Player -> Picker (Library button, Esc in the player). Playback continues in the tile.
+    void enter_picker() {
+        auto ui = lock();
+        if (!ui) return;
+        flush_progress();
+        library_->request_refresh();
+        (*ui)->set_active_popover(ActivePopover::None);
+
+        const bool video_present = player_->video_display_size().valid() &&
+                                   player_->state() != mpvx::PlaybackState::Idle;
+        if (!video_present) {
+            // Nothing to show in a tile (no file, audio-only, idle): plain crossfade.
+            // Audio keeps playing; the top bar's Now Playing pill is the way back.
+            (*ui)->set_mini_state(MiniState::Hidden);
+            (*ui)->set_view_mode(AppViewMode::Picker);
+            return;
+        }
+
+        mode_ = RenderTargetMode::FullToMini;
+        const uint64_t gen = ++target_gen_;
+        ++shadow_gen_;
+        (*ui)->set_mini_closing(false);
+        (*ui)->set_mini_shadow(0.0f);
+        (*ui)->set_mini_state(MiniState::Tile);
+        (*ui)->set_view_mode(AppViewMode::Picker);
+
+        // Settle detection (§5.3): the render target shrinks only once the morph is over.
+        const auto shrink_ms = (*ui)->global<Theme>().get_mini_shrink_duration();
+        slint::Timer::single_shot(std::chrono::milliseconds(shrink_ms + kSettleSlackMs),
+                                  [weak = weak_from_this(), gen]() {
+                                      if (auto self = weak.lock()) self->settle_shrink(gen);
+                                  });
+    }
+
+    // Mini (tile or pill) or plain picker -> Player. Playback state is untouched, so
+    // expanding from the pill stays paused (§4.2).
+    void expand() {
+        auto ui = lock();
+        if (!ui) return;
+        ++target_gen_;
+        ++shadow_gen_;
+        if (mode_ != RenderTargetMode::Full) {
+            mode_ = RenderTargetMode::Full;
+            apply_target(); // full size + forced redraw first, even while paused
+        }
+        (void)player_->set_mini_profile(false);
+        renderer_->set_frame_cap(false);
+        (*ui)->set_mini_shadow(0.0f);
+        (*ui)->set_mini_closing(false);
+        (*ui)->set_mini_state(MiniState::Hidden);
+        (*ui)->set_view_mode(AppViewMode::Player);
+        (*ui)->set_hud_visible(true);
+        (*ui)->set_pointer_idle_ms(0);
+    }
+
+    // Loading another file from the picker leaves mini mode first (§3.3).
+    void leave_for_load() {
+        auto ui = lock();
+        if (ui && (*ui)->get_mini_active()) expand();
+    }
+
+    // Tile ✕ / Ctrl+W: pause and collapse to the pill. The file stays loaded (§3.5).
+    void minimize() {
+        auto ui = lock();
+        if (!ui || (*ui)->get_mini_state() != MiniState::Tile) return;
+        ++shadow_gen_;
+        flush_progress();
+        (void)player_->pause();
+        renderer_->set_frame_cap(false);
+        (*ui)->set_mini_shadow(0.0f);
+        (*ui)->set_mini_state(MiniState::Pill);
+    }
+
+    // Pill -> tile. `resume` for ▶ / Space; the pill body restores still paused.
+    void restore(bool resume) {
+        auto ui = lock();
+        if (!ui || (*ui)->get_mini_state() != MiniState::Pill) return;
+        (*ui)->set_mini_state(MiniState::Tile);
+        if (resume) {
+            (void)player_->play();
+        }
+        update_frame_cap();
+
+        const uint64_t gen = ++shadow_gen_;
+        const auto collapse_ms = (*ui)->global<Theme>().get_mini_collapse_duration();
+        slint::Timer::single_shot(std::chrono::milliseconds(collapse_ms + kSettleSlackMs),
+                                  [weak = weak_from_this(), gen]() {
+                                      if (auto self = weak.lock()) self->settle_restore(gen);
+                                  });
+    }
+
+    void set_fps_cap(bool enabled) {
+        fps_cap_ = enabled;
+        update_frame_cap();
+    }
+
+    // Called on the GUI thread with the latest playback state.
+    void on_playback_state(mpvx::PlaybackState state) {
+        auto ui = lock();
+        if (!ui) return;
+        const MiniState mini = (*ui)->get_mini_state();
+        if (mini == MiniState::Hidden) return;
+
+        if (state != mpvx::PlaybackState::Idle) {
+            // Playback came back while fading out (e.g. a file loaded over IPC): stay mini.
+            if ((*ui)->get_mini_closing()) cancel_close();
+            // Pill => paused invariant (§3.5): an external resume restores the tile. A
+            // pause requested by minimize() but not yet confirmed by mpv still reads as
+            // Playing here, so only a resume that is also requested/observed counts.
+            if (state == mpvx::PlaybackState::Playing && mini == MiniState::Pill && !player_->is_paused()) {
+                restore(false);
+            }
+        } else if (player_->is_idle_active() && !(*ui)->get_mini_closing()) {
+            // Only real idleness closes the mini player. END_FILE also reports Idle between
+            // playlist entries (advance, loop-playlist), where playback continues (§3.7, §8).
+            close_on_idle();
+        }
+    }
+
+private:
+    static constexpr int64_t kSettleSlackMs = 40;
+
+    std::optional<slint::ComponentHandle<MainWindow>> lock() const { return ui_.lock(); }
+
+    void flush_progress() {
+        if (!active_media_path_->empty()) {
+            library_->record_playback_progress(*active_media_path_, player_->time_pos(), player_->duration(), true);
+        }
+    }
+
+    // Largest video-aspect rectangle inside the window (full) or the tile (mini), in
+    // physical pixels (§7.2).
+    void apply_target() {
+        auto ui = lock();
+        if (!ui) return;
+        auto& win = (*ui)->window();
+        int dst_w = 0;
+        int dst_h = 0;
+        if (mode_ == RenderTargetMode::Mini) {
+            const float scale = win.scale_factor();
+            dst_w = static_cast<int>(std::lround((*ui)->get_mini_w() * scale));
+            dst_h = static_cast<int>(std::lround((*ui)->get_mini_h() * scale));
+        } else {
+            const auto phys = win.size();
+            dst_w = static_cast<int>(phys.width);
+            dst_h = static_cast<int>(phys.height);
+        }
+        if (dst_w <= 0 || dst_h <= 0) return; // window not shown yet
+        const auto [w, h] = mpvx::fit_aspect(dst_w, dst_h, aspect_);
+        renderer_->set_target_size(w, h);
+    }
+
+    void settle_shrink(uint64_t gen) {
+        if (gen != target_gen_ || mode_ != RenderTargetMode::FullToMini) return;
+        auto ui = lock();
+        if (!ui) return;
+        mode_ = RenderTargetMode::Mini;
+        apply_target();
+        (void)player_->set_mini_profile(true);
+        if ((*ui)->get_mini_state() == MiniState::Tile) {
+            (*ui)->set_mini_shadow(1.0f); // a pill (minimized mid-shrink) has no shadow
+        }
+        update_frame_cap();
+    }
+
+    void settle_restore(uint64_t gen) {
+        // While the shrink is still settling, settle_shrink() turns the shadow on instead.
+        if (gen != shadow_gen_ || mode_ != RenderTargetMode::Mini) return;
+        if (auto ui = lock(); ui && (*ui)->get_mini_state() == MiniState::Tile) {
+            (*ui)->set_mini_shadow(1.0f);
+        }
+    }
+
+    // Playback went idle or failed while mini: fade out in place, then leave mini mode (§8).
+    void close_on_idle() {
+        auto ui = lock();
+        if (!ui) return;
+        const uint64_t gen = ++target_gen_;
+        ++shadow_gen_;
+        renderer_->set_frame_cap(false);
+        (*ui)->set_mini_shadow(0.0f);
+        (*ui)->set_mini_closing(true);
+
+        const auto fade_ms = (*ui)->global<Theme>().get_mini_close_fade_duration();
+        slint::Timer::single_shot(std::chrono::milliseconds(fade_ms + kSettleSlackMs),
+                                  [weak = weak_from_this(), gen]() {
+                                      auto self = weak.lock();
+                                      if (!self || gen != self->target_gen_) return;
+                                      auto ui = self->lock();
+                                      if (!ui) return;
+                                      (*ui)->set_mini_state(MiniState::Hidden);
+                                      (*ui)->set_mini_closing(false);
+                                      self->mode_ = RenderTargetMode::Full;
+                                      self->apply_target();
+                                      (void)self->player_->set_mini_profile(false);
+                                  });
+    }
+
+    // Undo close_on_idle() before its timer fires: fade back in, shadow and cap as before.
+    void cancel_close() {
+        auto ui = lock();
+        if (!ui) return;
+        ++target_gen_; // drops the pending close timer
+        (*ui)->set_mini_closing(false);
+        if (mode_ == RenderTargetMode::FullToMini) {
+            // The close dropped the shrink's settle timer: settle once the morph is surely over.
+            const uint64_t gen = target_gen_;
+            const auto shrink_ms = (*ui)->global<Theme>().get_mini_shrink_duration();
+            slint::Timer::single_shot(std::chrono::milliseconds(shrink_ms + kSettleSlackMs),
+                                      [weak = weak_from_this(), gen]() {
+                                          if (auto self = weak.lock()) self->settle_shrink(gen);
+                                      });
+            return;
+        }
+        if (mode_ == RenderTargetMode::Mini && (*ui)->get_mini_state() == MiniState::Tile) {
+            (*ui)->set_mini_shadow(1.0f);
+        }
+        update_frame_cap();
+    }
+
+    // The cap applies only to a playing tile (§3.6); every other state runs at full rate.
+    void update_frame_cap() {
+        auto ui = lock();
+        const bool tile = ui && (*ui)->get_mini_state() == MiniState::Tile;
+        renderer_->set_frame_cap(fps_cap_ && tile && mode_ == RenderTargetMode::Mini);
+    }
+
+    slint::ComponentWeakHandle<MainWindow> ui_;
+    std::shared_ptr<mpvx::Player> player_;
+    std::shared_ptr<mpvx::VideoRenderer> renderer_;
+    std::shared_ptr<mpvx::LibraryService> library_;
+    std::shared_ptr<std::string> active_media_path_;
+
+    RenderTargetMode mode_{RenderTargetMode::Full};
+    uint64_t target_gen_{0}; // guards render-target settle and idle-close timers
+    uint64_t shadow_gen_{0}; // guards shadow fade-in timers
+    double aspect_{0.0};
+    bool fps_cap_{false};
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -318,6 +605,10 @@ int main(int argc, char* argv[]) {
         });
     };
     library->initialize(std::move(lib_callbacks));
+
+    // Mini player state machine; also owns render-target sizing (largest video-aspect
+    // rectangle in physical pixels, so mpv never paints letterbox bars). GUI-thread only.
+    auto mini = std::make_shared<MiniPlayerController>(ui_weak, player, renderer, library, active_media_path);
 
     // Initialize software video renderer -> Slint Image (coalesced to prevent UI queue saturation)
     auto frame_in_flight = std::make_shared<std::atomic<bool>>(false);
@@ -389,11 +680,16 @@ int main(int argc, char* argv[]) {
 
     // Set up player event observers -> Thread-safe UI updates
     mpvx::PlayerCallbacks callbacks;
-    callbacks.on_state_changed = [ui_weak, library, player, active_media_path](mpvx::PlaybackState state) {
+    callbacks.on_state_changed = [ui_weak, library, player, renderer, mini, active_media_path](mpvx::PlaybackState state) {
         if (state == mpvx::PlaybackState::Paused && !active_media_path->empty()) {
             library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
         }
-        slint::invoke_from_event_loop([ui_weak, player]() {
+        if (state == mpvx::PlaybackState::Idle) {
+            // Playback ended without an explicit stop (e.g. error): keep libmpv's clear frame
+            // and any resize redraws away from the UI until the next video is configured.
+            renderer->suspend_output();
+        }
+        slint::invoke_from_event_loop([ui_weak, player, mini]() {
             if (auto ui_opt = ui_weak.lock()) {
                 auto ui = *ui_opt;
                 const auto latest = player->state();
@@ -402,6 +698,7 @@ int main(int argc, char* argv[]) {
                     ui->set_has_video(false);
                     ui->set_is_buffering(false);
                 }
+                mini->on_playback_state(latest);
             }
         });
     };
@@ -472,7 +769,16 @@ int main(int argc, char* argv[]) {
         });
     };
 
-    callbacks.on_file_loaded = [ui_weak](const std::string& /*file*/) {
+    callbacks.on_file_loaded = [ui_weak, renderer](const std::string& /*file*/) {
+        // Loading a file ends the previous one (END_FILE -> Idle -> suspend_output()), so
+        // frame delivery must resume for every newly loaded file. video-out-params alone is
+        // not enough: mpv deduplicates property changes, so a next file with the same
+        // display size may produce no video-size event at all and output would stay
+        // suspended (stuck last frame, "mpv_render_context_render() not being called").
+        // FILE_LOADED fires after the old file's clear frame and never on stop, and before
+        // the new file's first frame, so anything rendered while suspended is that clear
+        // frame: drop it instead of re-rendering it (a black flash before the new file).
+        renderer->resume_output(mpvx::VideoRenderer::ResumeFrom::NextFrame);
         slint::invoke_from_event_loop([ui_weak]() {
             if (auto ui_opt = ui_weak.lock()) {
                 auto ui = *ui_opt;
@@ -546,6 +852,13 @@ int main(int argc, char* argv[]) {
         });
     };
 
+    callbacks.on_video_size = [renderer, mini](mpvx::VideoDisplaySize size) {
+        if (size.valid()) {
+            renderer->resume_output(); // video (re)configured, e.g. after a track change
+        }
+        slint::invoke_from_event_loop([mini, size]() { mini->set_video_size(size); });
+    };
+
     player->set_callbacks(std::move(callbacks));
 
     // --- Bind UI Callbacks -> Player & Window Actions ---
@@ -567,7 +880,10 @@ int main(int argc, char* argv[]) {
         (void)player->playlist_next();
     });
 
-    main_window->on_stop_clicked([player, ui_weak]() {
+    main_window->on_stop_clicked([player, renderer, ui_weak]() {
+        // Suspend before stopping: libmpv renders a black clear frame right after `stop`,
+        // which would otherwise set has-video back to true.
+        renderer->suspend_output();
         (void)player->stop();
         if (auto ui_opt = ui_weak.lock()) {
             auto ui = *ui_opt;
@@ -672,9 +988,10 @@ int main(int argc, char* argv[]) {
         (void)player->set_aspect_override(std::string_view(aspect));
     });
 
-    main_window->on_open_url_submitted([player, library, ui_weak, active_media_path](slint::SharedString url) {
+    main_window->on_open_url_submitted([player, library, ui_weak, mini, active_media_path](slint::SharedString url) {
         std::string target(url);
         if (target.empty()) return;
+        mini->leave_for_load();
         if (!active_media_path->empty()) {
             library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
         }
@@ -692,11 +1009,12 @@ int main(int argc, char* argv[]) {
         (void)player->play();
     });
 
-    main_window->on_open_file_clicked([player, library, ui_weak, active_media_path]() {
-        library->open_media_file_dialog("Open Media File", [player, library, ui_weak, active_media_path](std::optional<std::string> chosen) {
+    main_window->on_open_file_clicked([player, library, ui_weak, mini, active_media_path]() {
+        library->open_media_file_dialog("Open Media File", [player, library, ui_weak, mini, active_media_path](std::optional<std::string> chosen) {
             if (chosen.has_value()) {
                 std::string path = std::move(*chosen);
-                slint::invoke_from_event_loop([player, library, ui_weak, active_media_path, path = std::move(path)]() {
+                slint::invoke_from_event_loop([player, library, ui_weak, mini, active_media_path, path = std::move(path)]() {
+                    mini->leave_for_load();
                     if (!active_media_path->empty()) {
                         library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
                     }
@@ -745,9 +1063,10 @@ int main(int argc, char* argv[]) {
         library->navigate_up();
     });
 
-    main_window->on_picker_video_clicked([player, library, ui_weak, active_media_path](slint::SharedString path, bool resume) {
+    main_window->on_picker_video_clicked([player, library, ui_weak, mini, active_media_path](slint::SharedString path, bool resume) {
         std::string target(path);
         if (target.empty()) return;
+        mini->leave_for_load(); // from the tile, the morph starts at the tile (§3.3)
         if (!active_media_path->empty() && *active_media_path != target) {
             library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
         }
@@ -807,25 +1126,15 @@ int main(int argc, char* argv[]) {
         });
     });
 
-    main_window->on_return_to_picker_clicked([player, library, ui_weak, active_media_path]() {
-        if (!active_media_path->empty()) {
-            library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
-        }
-        (void)player->pause();
-        library->request_refresh();
-        if (auto ui_opt = ui_weak.lock()) {
-            (*ui_opt)->set_view_mode(AppViewMode::Picker);
-        }
-    });
-
-    main_window->on_return_to_player_clicked([ui_weak]() {
-        if (auto ui_opt = ui_weak.lock()) {
-            auto ui = *ui_opt;
-            ui->set_view_mode(AppViewMode::Player);
-            ui->set_hud_visible(true);
-            ui->set_pointer_idle_ms(0);
-        }
-    });
+    // --- Mini Player (docs/mini-player-ui-spec.md) ---
+    // Playback no longer pauses when the library opens; it continues in the mini player.
+    main_window->on_return_to_picker_clicked([mini]() { mini->enter_picker(); });
+    main_window->on_return_to_player_clicked([mini]() { mini->expand(); });
+    main_window->on_mini_expand_clicked([mini]() { mini->expand(); });
+    main_window->on_mini_minimize_clicked([mini]() { mini->minimize(); });
+    main_window->on_mini_restore_clicked([mini](bool resume) { mini->restore(resume); });
+    main_window->on_mini_geometry_changed([mini]() { mini->on_mini_geometry_changed(); });
+    main_window->on_mini_fps_cap_changed([mini](bool enabled) { mini->set_fps_cap(enabled); });
 
     // Frameless Window Management
     main_window->on_minimize_clicked([ui_weak]() {
@@ -869,10 +1178,10 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    main_window->on_viewport_resized([renderer](int w, int h) {
-        int clamped_w = std::clamp(w, 320, 3840);
-        int clamped_h = std::clamp(h, 240, 2160);
-        renderer->resize(clamped_w, clamped_h);
+    // The Slint callback reports logical pixels; the controller reads the window's physical
+    // size directly so HiDPI output is rendered at native resolution.
+    main_window->on_viewport_resized([mini](int /*logical_w*/, int /*logical_h*/) {
+        mini->on_window_resized();
     });
 
     // Check CLI argument
@@ -895,6 +1204,9 @@ int main(int argc, char* argv[]) {
         library->record_playback_progress(*active_media_path, player->time_pos(), player->duration(), true);
     }
     library->shutdown();
+    const auto render_stats = renderer->stats();
+    std::println("[mpvx] Renderer: {} frames rendered, {} pixel-buffer allocations",
+                 render_stats.frames_rendered, render_stats.buffer_allocations);
     renderer->shutdown();
     player->shutdown();
 
