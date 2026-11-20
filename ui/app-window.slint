@@ -7,6 +7,7 @@ import {
     ChapterItem,
     AppViewMode,
     MiniState,
+    MiniCorner,
     PickerNavKind,
     PickerSortMode,
     VideoEntry,
@@ -20,10 +21,12 @@ import { ControlsBar } from "components/controls.slint";
 import { PopoverLayer } from "components/popovers.slint";
 import { VideoPicker } from "components/picker/video-picker.slint";
 import { MiniPill } from "components/mini-pill.slint";
+import { MiniCornerGuides } from "components/mini-corner-guides.slint";
 
 export {
     Theme,
     MiniState,
+    MiniCorner,
     LoopMode,
     AbLoopState,
     ActivePopover,
@@ -97,10 +100,21 @@ export component MainWindow inherits Window {
     property <float> picker-opacity: root.view-mode == AppViewMode.Picker ? 1.0 : 0.0;
     animate picker-opacity { duration: 220ms; easing: ease-out; }
 
-    // --- Mini Player State (docs/mini-player-ui-spec.md §5, §6.2) ---
+    // --- Mini Player State (docs/mini-player-ui-spec.md §5, §6.2, §12) ---
     // view-mode and mini-state are always assigned together by C++; Player + Tile/Pill is invalid.
     in-out property <MiniState> mini-state: MiniState.Hidden;
     out property <bool> mini-active: root.mini-state != MiniState.Hidden;
+    in-out property <MiniCorner> mini-corner: MiniCorner.BottomRight;
+    out property <bool> mini-dragging: false;
+    out property <bool> mini-snapping: false;
+    property <length> mini-drag-x: 0px;
+    property <length> mini-drag-y: 0px;
+    // The tile is pinned at (mini-drag-x, mini-drag-y) without dragging: pressed mid-snap
+    // (§12.3.5), or expanded mid-drag / mid-snap so the morph starts where the tile is (§12.4C).
+    property <bool> mini-held: false;
+    property <MiniCorner> mini-snap-preview: root.mini-dragging
+        ? root.nearest-corner(root.mini-drag-x, root.mini-drag-y)
+        : root.mini-corner;
     in property <float> video-aspect: 16 / 9;      // display aspect from mpv; 16/9 until known
     in property <float> mini-shadow: 0.0;          // 0..1, C++ sets 1 after settle, 0 at motion start
     in property <bool> mini-closing: false;        // playback went idle: fade the tile/pill out in place
@@ -114,9 +128,21 @@ export component MainWindow inherits Window {
     out property <length> mini-w: root.mini-portrait ? root.mini-portrait-h * root.mini-aspect : root.mini-landscape-w;
     out property <length> mini-h: root.mini-portrait ? root.mini-portrait-h : root.mini-landscape-w / root.mini-aspect;
     out property <length> pill-w: mini-pill.ideal-width;
-    out property <length> picker-bottom-inset: root.mini-state == MiniState.Tile ? root.mini-h + 2 * Theme.mini-margin
+    property <bool> mini-at-bottom: root.mini-corner == MiniCorner.BottomRight || root.mini-corner == MiniCorner.BottomLeft;
+    out property <length> picker-bottom-inset: !root.mini-at-bottom ? 0px
+        : root.mini-state == MiniState.Tile ? root.mini-h + 2 * Theme.mini-margin
         : root.mini-state == MiniState.Pill ? Theme.mini-pill-height + 2 * Theme.mini-margin
         : 0px;
+    // Top corners reserve a band above the whole picker instead: nothing there scrolls, so
+    // the tile or pill would otherwise cover the breadcrumbs, sidebar nav and first row.
+    out property <length> picker-top-clearance: root.mini-at-bottom ? 0px
+        : root.mini-state == MiniState.Tile ? Theme.mini-top-margin + root.mini-h + Theme.mini-margin
+        : root.mini-state == MiniState.Pill ? Theme.mini-top-margin + Theme.mini-pill-height + Theme.mini-margin
+        : 0px;
+    out property <length> mini-tile-x: video-view.shown-tile-x;
+    out property <length> mini-tile-y: video-view.shown-tile-y;
+    out property <length> mini-pill-x: mini-pill.x;
+    out property <length> mini-pill-y: mini-pill.y;
 
     // Player <-> mini morph (§4.1, §4.2)
     out property <float> mini-t: root.mini-active ? 1.0 : 0.0;
@@ -213,6 +239,49 @@ export component MainWindow inherits Window {
     callback mini-geometry-changed();                   // tile size changed; C++ reads mini-w/h
     callback mini-fps-cap-changed(bool);
 
+    function corner-x(c: MiniCorner, w: length) -> length {
+        return (c == MiniCorner.BottomRight || c == MiniCorner.TopRight)
+            ? window-shell.width - w - Theme.mini-margin
+            : Theme.mini-margin;
+    }
+
+    function corner-y(c: MiniCorner, h: length) -> length {
+        return (c == MiniCorner.BottomRight || c == MiniCorner.BottomLeft)
+            ? window-shell.height - h - Theme.mini-margin
+            : Theme.mini-top-margin;
+    }
+
+    function nearest-corner(x: length, y: length) -> MiniCorner {
+        if (x + root.mini-w / 2 >= window-shell.width / 2) {
+            return (y + root.mini-h / 2 >= (Theme.mini-top-margin + window-shell.height - Theme.mini-margin) / 2)
+                ? MiniCorner.BottomRight
+                : MiniCorner.TopRight;
+        } else {
+            return (y + root.mini-h / 2 >= (Theme.mini-top-margin + window-shell.height - Theme.mini-margin) / 2)
+                ? MiniCorner.BottomLeft
+                : MiniCorner.TopLeft;
+        }
+    }
+
+    // Spring the tile from where it is to the corner in mini-corner (§12.4B).
+    function start-snap() {
+        root.mini-snapping = true;
+        root.mini-dragging = false;
+        root.mini-held = false;
+        snap-settle-timer.running = false;
+        snap-settle-timer.running = true;
+    }
+
+    // Pin the tile at its current drawn position and stop any snap in flight.
+    function hold-tile() {
+        root.mini-drag-x = video-view.shown-tile-x;
+        root.mini-drag-y = video-view.shown-tile-y;
+        snap-settle-timer.running = false;
+        root.mini-snapping = false;
+        root.mini-dragging = false;
+        root.mini-held = true;
+    }
+
     function reset-hud-timer() {
         root.pointer-idle-ms = 0;
         root.hud-visible = true;
@@ -252,9 +321,45 @@ export component MainWindow inherits Window {
         running: false;
         triggered => { self.running = false; }
     }
+    snap-settle-timer := Timer {
+        interval: Theme.mini-snap-duration + 20ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            root.mini-snapping = false;
+        }
+    }
     changed mini-active => {
         if (!root.mini-active && root.view-mode == AppViewMode.Player) {
             expand-click-guard.running = true;
+        }
+    }
+    changed mini-state => {
+        if (root.mini-state == MiniState.Tile) {
+            root.mini-dragging = false;
+            root.mini-held = false;
+            root.mini-snapping = false;
+            snap-settle-timer.running = false;
+        } else if (root.mini-state == MiniState.Hidden) {
+            // Expand mid-drag / mid-snap (§12.4C): no corner is committed; the morph to full
+            // screen starts from wherever the tile is.
+            if (root.mini-dragging || root.mini-snapping) {
+                root.hold-tile();
+            }
+        } else {
+            // Minimize mid-drag / mid-snap: commit the hovered corner and collapse into it.
+            if (root.mini-dragging) {
+                root.mini-corner = root.nearest-corner(root.mini-drag-x, root.mini-drag-y);
+            }
+            if (root.mini-dragging || root.mini-held) {
+                root.start-snap();
+            }
+        }
+    }
+    changed mini-closing => {
+        if (root.mini-closing && root.mini-dragging) {
+            root.mini-corner = root.nearest-corner(root.mini-drag-x, root.mini-drag-y);
+            root.start-snap();
         }
     }
 
@@ -301,6 +406,7 @@ export component MainWindow inherits Window {
             height: 100%;
             opacity: root.morphing ? 1.0 : root.picker-opacity;
             bottom-inset: root.picker-bottom-inset;
+            top-clearance: root.picker-top-clearance;
             sidebar-open: root.sidebar-open;
             active-nav-kind: root.active-nav-kind;
             folders: root.picker-folders;
@@ -324,18 +430,50 @@ export component MainWindow inherits Window {
             open-folder-clicked => { root.picker-open-external-folder(); }
         }
 
-        // 2. Video Canvas: full-bleed in the player, morphs into the mini tile/pill (§6.3).
+        // 1b. Corner Drop-Zone Targets (shown beneath the dragged mini tile, v2 §12.2)
+        MiniCornerGuides {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            active: root.mini-dragging && root.mini-state == MiniState.Tile && !root.mini-closing;
+            target-corner: root.mini-snap-preview;
+            tile-width: root.mini-w;
+            tile-height: root.mini-h;
+        }
+
+        // 2. Video Canvas: full-bleed in the player, morphs into the mini tile/pill (§6.3, §12).
         // The single persistent moving element: never recreated, never reparented (§4.5 rule 1).
         video-view := VideoView {
-            // Tile rect
-            property <length> tile-x: window-shell.width - root.mini-w - Theme.mini-margin;
-            property <length> tile-y: window-shell.height - root.mini-h - Theme.mini-margin;
-            // Pill rect
-            property <length> pill-x: window-shell.width - root.pill-w - Theme.mini-margin;
-            property <length> pill-y: window-shell.height - Theme.mini-pill-height - Theme.mini-margin;
+            // Corner-anchored tile & pill rects (v2 supports all 4 corners)
+            property <length> target-tile-x: root.corner-x(root.mini-corner, root.mini-w);
+            property <length> target-tile-y: root.corner-y(root.mini-corner, root.mini-h);
+            property <length> tile-x: (root.mini-dragging || root.mini-held) ? root.mini-drag-x : self.target-tile-x;
+            property <length> tile-y: (root.mini-dragging || root.mini-held) ? root.mini-drag-y : self.target-tile-y;
+            animate tile-x {
+                duration: root.mini-snapping ? Theme.mini-snap-duration : 0ms;
+                easing: cubic-bezier(0.22, 1.25, 0.36, 1);
+            }
+            animate tile-y {
+                duration: root.mini-snapping ? Theme.mini-snap-duration : 0ms;
+                easing: cubic-bezier(0.22, 1.25, 0.36, 1);
+            }
+            // The spring overshoots by ~2% of its travel, which on a long throw in a large window
+            // passes the 16px margin. Keep it inside the drag pads (8px sides, 64px under TopBar).
+            property <length> shown-tile-x: !root.mini-snapping ? self.tile-x : clamp(
+                self.tile-x,
+                Theme.mini-drag-edge-pad,
+                max(Theme.mini-drag-edge-pad, window-shell.width - root.mini-w - Theme.mini-drag-edge-pad));
+            property <length> shown-tile-y: !root.mini-snapping ? self.tile-y : clamp(
+                self.tile-y,
+                Theme.mini-top-drag-edge-pad,
+                max(Theme.mini-top-drag-edge-pad, window-shell.height - root.mini-h - Theme.mini-drag-edge-pad));
+
+            property <length> pill-x: root.corner-x(root.mini-corner, root.pill-w);
+            property <length> pill-y: root.corner-y(root.mini-corner, Theme.mini-pill-height);
             // Mini rect = tile rect interpolated toward the pill rect by collapse-t
-            property <length> m-x: self.tile-x + (self.pill-x - self.tile-x) * root.collapse-t;
-            property <length> m-y: self.tile-y + (self.pill-y - self.tile-y) * root.collapse-t;
+            property <length> m-x: self.shown-tile-x + (self.pill-x - self.shown-tile-x) * root.collapse-t;
+            property <length> m-y: self.shown-tile-y + (self.pill-y - self.shown-tile-y) * root.collapse-t;
             property <length> m-w: root.mini-w + (root.pill-w - root.mini-w) * root.collapse-t;
             property <length> m-h: root.mini-h + (Theme.mini-pill-height - root.mini-h) * root.collapse-t;
 
@@ -346,9 +484,17 @@ export component MainWindow inherits Window {
             height: window-shell.height + (self.m-h - window-shell.height) * root.mini-t;
             border-radius: (Theme.card-radius + (Theme.mini-pill-radius - Theme.card-radius) * root.collapse-t) * root.mini-t;
 
-            drop-shadow-blur: root.shadow-k > 0.0 ? 24px : 0px;
-            drop-shadow-offset-y: 8px;
-            drop-shadow-color: #00000099.transparentize(1.0 - root.shadow-k);
+            property <bool> drag-lifted: root.mini-dragging && root.mini-state == MiniState.Tile;
+            // During drag and snap the tile only translates, so the fixed 24px shadow is never
+            // re-blurred (§4.5 rule 3, §12.2). Keeping it through the snap lets the lift ease
+            // out even when the drag began before the settled shadow (shadow-k == 0).
+            property <bool> drag-shadow: (root.mini-dragging || root.mini-snapping)
+                && root.mini-state == MiniState.Tile && !root.mini-closing;
+            drop-shadow-blur: (root.shadow-k > 0.0 || self.drag-shadow) ? 24px : 0px;
+            drop-shadow-offset-y: self.drag-lifted ? 14px : 8px;
+            drop-shadow-color: self.drag-lifted ? #000000cc : #00000099.transparentize(1.0 - root.shadow-k);
+            animate drop-shadow-offset-y { duration: 140ms; easing: ease-out; }
+            animate drop-shadow-color { duration: 140ms; easing: ease-out; }
 
             // Outside a morph, VideoView fades in over the picker (plain crossfade when no
             // mini player is involved, e.g. opening a file from an empty picker).
@@ -364,6 +510,11 @@ export component MainWindow inherits Window {
             mini-mode: root.mini-t > 0.5;
             suppress-clicks: expand-click-guard.running;
             mini-chrome-visible: root.mini-state == MiniState.Tile && root.mini-t >= 0.95 && root.collapse-t == 0.0 && !root.mini-closing;
+            mini-dragging: root.mini-dragging;
+            mini-snapping: root.mini-snapping;
+            // Drag only once the shrink has finished: mid-morph the drawn rect is m-x * mini-t
+            // and still resizing, so a drag seeded from the resting position would jump.
+            mini-drag-enabled: root.mini-t >= 1.0;
             progress: root.progress;
             media-title: root.media-title;
 
@@ -380,6 +531,51 @@ export component MainWindow inherits Window {
             expand-clicked => { root.mini-expand-clicked(); }
             mini-play-pause-clicked => { root.play-pause-clicked(); }
             mini-minimize-clicked => { root.mini-minimize-clicked(); }
+            // A press during a snap freezes the spring where it is, so the tile does not move
+            // under the pointer and the spring's motion never counts toward the drag
+            // threshold (§12.3.5). Releasing without dragging lets the snap finish.
+            mini-press-started => {
+                if (root.mini-snapping) {
+                    root.hold-tile();
+                }
+            }
+            mini-press-released => {
+                if (root.mini-held && root.mini-state == MiniState.Tile && !root.mini-closing) {
+                    root.start-snap();
+                }
+            }
+            mini-drag-started => {
+                if (!root.mini-held) {
+                    root.mini-drag-x = self.shown-tile-x;
+                    root.mini-drag-y = self.shown-tile-y;
+                }
+                snap-settle-timer.running = false;
+                root.mini-snapping = false;
+                root.mini-held = false;
+                root.mini-dragging = true;
+            }
+            mini-drag-moved(dx, dy) => {
+                if (!root.mini-dragging) {
+                    return;
+                }
+                root.mini-drag-x = clamp(
+                    root.mini-drag-x + dx,
+                    Theme.mini-drag-edge-pad,
+                    max(Theme.mini-drag-edge-pad, window-shell.width - root.mini-w - Theme.mini-drag-edge-pad)
+                );
+                root.mini-drag-y = clamp(
+                    root.mini-drag-y + dy,
+                    Theme.mini-top-drag-edge-pad,
+                    max(Theme.mini-top-drag-edge-pad, window-shell.height - root.mini-h - Theme.mini-drag-edge-pad)
+                );
+            }
+            mini-drag-ended => {
+                if (!root.mini-dragging) {
+                    return;
+                }
+                root.mini-corner = root.nearest-corner(root.mini-drag-x, root.mini-drag-y);
+                root.start-snap();
+            }
         }
 
         // 3. Minimized mini player, drawn above the video so it covers the collapsing tile (§4.4)

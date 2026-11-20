@@ -43,6 +43,13 @@ export enum MiniState {
     Pill,
 }
 
+export enum MiniCorner {
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+}
+
 export enum AppViewMode {
     Picker,
     Player,
@@ -158,10 +165,15 @@ export global Theme {
     out property <duration> mini-expand-duration: 260ms;
     out property <duration> mini-collapse-duration: 220ms;
     out property <duration> mini-close-fade-duration: 160ms;
+    out property <duration> mini-snap-duration: 240ms;
     // Clicks on the video are ignored this long after leaving mini mode, so the second click
     // of a double-click on the tile neither toggles pause nor fullscreen (§3.3).
     out property <duration> mini-expand-click-guard: 500ms;
     out property <length> mini-margin: 16px;
+    out property <length> mini-top-margin: 72px; // top-bar-content-height (56px) + mini-margin (16px)
+    out property <length> mini-drag-threshold: 6px;
+    out property <length> mini-drag-edge-pad: 8px;
+    out property <length> mini-top-drag-edge-pad: 64px; // clears TopBar gradient height (64px)
     out property <length> mini-min-width: 280px;
     out property <length> mini-max-width: 480px;
     out property <float> mini-width-ratio: 0.26;

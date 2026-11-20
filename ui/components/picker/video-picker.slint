@@ -24,6 +24,9 @@ export component VideoPicker inherits Rectangle {
     in property <string> search-query: "";
     // Extra bottom padding so content can scroll clear of the mini player (not animated).
     in property <length> bottom-inset: 0px;
+    // Window y where content may start, so a mini player docked in a top corner never covers
+    // the sidebar, breadcrumbs or first row (not animated). 0 keeps the default top padding.
+    in property <length> top-clearance: 0px;
 
     callback nav-selected(PickerNavKind, string /* path */);
     callback folder-toggled(string /* path */);
@@ -45,7 +48,7 @@ export component VideoPicker inherits Rectangle {
     clip: true;
 
     HorizontalLayout {
-        padding-top: Theme.top-bar-content-height + 4px;
+        padding-top: max(Theme.top-bar-content-height + 4px, root.top-clearance);
         padding-left: 12px;
         padding-right: 12px;
         padding-bottom: 12px;

@@ -3,6 +3,8 @@ import { Theme } from "../theme.slint";
 export component IconButton inherits Rectangle {
     in property <image> icon;
     in property <bool> enabled: true;
+    // Blocks input without the disabled styling, e.g. while a fading button is on its way out.
+    in property <bool> interactive: true;
     in property <bool> active: false;
     in property <bool> accent: false;
     in property <bool> muted: false;
@@ -25,7 +27,7 @@ export component IconButton inherits Rectangle {
     accessible-checkable: true;
     accessible-checked: root.active;
     accessible-action-default => {
-        if (root.enabled) {
+        if (root.enabled && root.interactive) {
             root.clicked();
         }
     }
@@ -52,8 +54,8 @@ export component IconButton inherits Rectangle {
     }
 
     touch := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        enabled: root.enabled && root.interactive;
+        mouse-cursor: self.enabled ? MouseCursor.pointer : MouseCursor.default;
         clicked => { root.clicked(); }
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {

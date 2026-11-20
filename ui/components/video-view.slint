@@ -8,9 +8,12 @@ export component VideoView inherits Rectangle {
     in property <bool> is-buffering: false;
     in property <bool> hud-visible: true;
 
-    // Mini player (docs/mini-player-ui-spec.md §6.4)
+    // Mini player (docs/mini-player-ui-spec.md §6.4, §12)
     in property <bool> mini-mode: false;          // tile-sized: click expands, no placeholder
     in property <bool> mini-chrome-visible: false; // settled tile: show MiniOverlay
+    in property <bool> mini-dragging: false;      // actively dragging the tile
+    in property <bool> mini-snapping: false;      // spring snap animation in flight
+    in property <bool> mini-drag-enabled: true;   // shrink morph finished: tile can be dragged
     in property <float> progress: 0.0;
     in property <string> media-title: "";
     in property <bool> suppress-clicks: false;     // just expanded from mini: swallow clicks
@@ -22,6 +25,11 @@ export component VideoView inherits Rectangle {
     callback expand-clicked();
     callback mini-play-pause-clicked();
     callback mini-minimize-clicked();
+    callback mini-press-started();
+    callback mini-press-released();
+    callback mini-drag-started();
+    callback mini-drag-moved(length, length);
+    callback mini-drag-ended();
 
     background: Theme.canvas-bg;
     clip: true;
@@ -203,8 +211,16 @@ export component VideoView inherits Rectangle {
         progress: root.progress;
         media-title: root.media-title;
         corner-radius: root.border-radius;
+        dragging: root.mini-dragging;
+        snapping: root.mini-snapping;
+        drag-enabled: root.mini-drag-enabled;
         play-pause-clicked => { root.mini-play-pause-clicked(); }
         expand-clicked => { root.expand-clicked(); }
         minimize-clicked => { root.mini-minimize-clicked(); }
+        press-started => { root.mini-press-started(); }
+        press-released => { root.mini-press-released(); }
+        drag-started => { root.mini-drag-started(); }
+        drag-moved(dx, dy) => { root.mini-drag-moved(dx, dy); }
+        drag-ended => { root.mini-drag-ended(); }
     }
 }

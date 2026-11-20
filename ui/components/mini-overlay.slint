@@ -1,7 +1,7 @@
 import { Theme } from "../theme.slint";
 import { IconButton } from "icon-button.slint";
 
-// Chrome for the settled mini player tile (docs/mini-player-ui-spec.md §3.2).
+// Chrome for the settled mini player tile (docs/mini-player-ui-spec.md §3.2, §12.2–§12.3).
 // Shown only after the morph settles, so it is never composited during an animation.
 // All geometry is absolute (no layouts), per §4.5 rule 4.
 export component MiniOverlay inherits Rectangle {
@@ -9,65 +9,150 @@ export component MiniOverlay inherits Rectangle {
     in property <float> progress: 0.0;
     in property <string> media-title: "";
     in property <length> corner-radius: Theme.card-radius;
+    in property <bool> dragging: false;
+    in property <bool> snapping: false;
+    // False while the shrink morph is still running: the drawn rect is still interpolating, so a
+    // drag seeded from the resting tile position would jump away from the cursor.
+    in property <bool> drag-enabled: true;
 
     callback play-pause-clicked();
     callback expand-clicked();
     callback minimize-clicked();
+    callback press-started();   // left press on the body (freezes an in-flight snap, §12.3.5)
+    callback press-released();  // left release without crossing the drag threshold
+    callback drag-started();
+    callback drag-moved(length, length);
+    callback drag-ended();
 
     property <bool> hovered: body-touch.has-hover || play-btn.has-hover || expand-btn.has-hover || close-btn.has-hover;
+    property <bool> chrome-hovered: root.hovered && !root.dragging;
 
     accessible-role: button;
     accessible-label: "Mini player: " + root.media-title + ". Activate to expand.";
     accessible-action-default => { root.expand-clicked(); }
 
-    // Body: click (and double-click) expands. The buttons are children so hovering them
-    // keeps the tile hovered.
+    // Body: click expands, dragging past threshold repositions to any of the four corners.
     body-touch := TouchArea {
-        width: 100%;
-        height: 100%;
-        mouse-cursor: MouseCursor.pointer;
+        property <bool> left-pressed: false;
+        property <bool> armed: false;
+        property <bool> drag-active: false;
+        property <bool> did-drag: false;
+
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.grab;
+
+        clicked => {
+            if (self.did-drag) {
+                self.did-drag = false;
+                return;
+            }
+            root.expand-clicked();
+        }
+
+        // Only the left button starts or resets a drag (§12.3.2): pressing another button
+        // mid-drag must not drop the drag state, or the left release would skip drag-ended()
+        // and then expand. Releasing another button does end the drag, because Slint ends the
+        // pointer grab on any release and the tile could no longer follow the pointer once it
+        // left the tile. did-drag stays set, so the later left release does not expand.
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (event.button != PointerEventButton.left) {
+                    return;
+                }
+                self.left-pressed = true;
+                self.drag-active = false;
+                self.did-drag = false;
+                self.armed = root.drag-enabled;
+                if (self.armed) {
+                    root.press-started();
+                }
+            } else if (event.kind == PointerEventKind.move) {
+                if (self.pressed && self.left-pressed && self.armed) {
+                    if (!self.drag-active) {
+                        if (((self.mouse-x - self.pressed-x) * (self.mouse-x - self.pressed-x)
+                           + (self.mouse-y - self.pressed-y) * (self.mouse-y - self.pressed-y))
+                            >= Theme.mini-drag-threshold * Theme.mini-drag-threshold) {
+                            self.drag-active = true;
+                            self.did-drag = true;
+                            root.drag-started();
+                        }
+                    }
+                    if (self.drag-active) {
+                        root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                    }
+                }
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                if (event.kind == PointerEventKind.cancel || event.button == PointerEventButton.left) {
+                    self.left-pressed = false;
+                }
+                if (self.drag-active) {
+                    self.drag-active = false;
+                    root.drag-ended();
+                } else if (self.armed) {
+                    root.press-released();
+                }
+                self.armed = false;
+            }
+        }
+    }
+
+    // Hover scrim (fades away while dragging so the video stays clear)
+    Rectangle {
+        background: Theme.mini-scrim;
+        opacity: root.chrome-hovered ? 1.0 : 0.0;
+        animate opacity { duration: 150ms; easing: ease-out; }
+    }
+
+    // Subtle top-left drag grip pill (hover only)
+    Rectangle {
+        x: 10px;
+        y: 14px;
+        width: 18px;
+        height: 3px;
+        border-radius: 1.5px;
+        background: #ffffff66;
+        opacity: root.chrome-hovered ? 1.0 : 0.0;
+        animate opacity { duration: 150ms; easing: ease-out; }
+    }
+
+    // Centre play/pause (44px circle)
+    play-btn := IconButton {
+        width: 44px;
+        height: 44px;
+        border-radius: 22px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        opacity: root.chrome-hovered ? 1.0 : 0.0;
+        visible: self.opacity > 0.01;
+        interactive: root.chrome-hovered;
+        icon: root.is-playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play.svg");
+        tooltip: root.is-playing ? "Pause" : "Play";
+        animate opacity { duration: 150ms; easing: ease-out; }
+        clicked => { root.play-pause-clicked(); }
+    }
+
+    // Top-right: expand, then pause + minimize
+    expand-btn := IconButton {
+        x: parent.width - 2 * self.width - 8px;
+        y: 6px;
+        opacity: root.chrome-hovered ? 1.0 : 0.0;
+        visible: self.opacity > 0.01;
+        interactive: root.chrome-hovered;
+        icon: @image-url("../assets/icons/maximize-2.svg");
+        tooltip: "Expand";
+        animate opacity { duration: 150ms; easing: ease-out; }
         clicked => { root.expand-clicked(); }
+    }
 
-        // Hover scrim
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            background: Theme.mini-scrim;
-            opacity: root.hovered ? 1.0 : 0.0;
-            animate opacity { duration: 150ms; easing: ease-out; }
-        }
-
-        // Centre play/pause (44px circle)
-        play-btn := IconButton {
-            width: 44px;
-            height: 44px;
-            border-radius: 22px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            visible: root.hovered;
-            icon: root.is-playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play.svg");
-            tooltip: root.is-playing ? "Pause" : "Play";
-            clicked => { root.play-pause-clicked(); }
-        }
-
-        // Top-right: expand, then pause + minimize
-        expand-btn := IconButton {
-            x: parent.width - 2 * self.width - 8px;
-            y: 6px;
-            visible: root.hovered;
-            icon: @image-url("../assets/icons/maximize-2.svg");
-            tooltip: "Expand";
-            clicked => { root.expand-clicked(); }
-        }
-
-        close-btn := IconButton {
-            x: parent.width - self.width - 6px;
-            y: 6px;
-            visible: root.hovered;
-            icon: @image-url("../assets/icons/x.svg");
-            tooltip: "Pause and minimize";
-            clicked => { root.minimize-clicked(); }
-        }
+    close-btn := IconButton {
+        x: parent.width - self.width - 6px;
+        y: 6px;
+        opacity: root.chrome-hovered ? 1.0 : 0.0;
+        visible: self.opacity > 0.01;
+        interactive: root.chrome-hovered;
+        icon: @image-url("../assets/icons/x.svg");
+        tooltip: "Pause and minimize";
+        animate opacity { duration: 150ms; easing: ease-out; }
+        clicked => { root.minimize-clicked(); }
     }
 
     // 3px progress line: the only always-visible chrome
@@ -87,14 +172,15 @@ export component MiniOverlay inherits Rectangle {
         }
     }
 
-    // 1px border ring, brighter on hover
+    // 1px border ring, brighter on hover, indigo accent while dragging/snapping
     Rectangle {
-        width: 100%;
-        height: 100%;
-        background: transparent;
         border-radius: root.corner-radius;
-        border-width: 1px;
-        border-color: root.hovered ? Theme.card-border-hover : Theme.card-border;
-        animate border-color { duration: 150ms; easing: ease-out; }
+        border-width: (root.dragging || root.snapping) ? 1.5px : 1px;
+        border-color: root.dragging ? #818cf8d9
+                    : root.snapping ? #818cf880
+                    : root.hovered ? Theme.card-border-hover
+                    : Theme.card-border;
+        animate border-color { duration: 140ms; easing: ease-out; }
+        animate border-width { duration: 140ms; easing: ease-out; }
     }
 }

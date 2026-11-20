@@ -1,0 +1,86 @@
+import { Theme, MiniCorner } from "../theme.slint";
+
+component CornerGuideSlot inherits Rectangle {
+    in property <bool> is-target: false;
+
+    border-radius: Theme.card-radius;
+    background: root.is-target ? #818cf822 : #090a0f59;
+    border-width: root.is-target ? 1.5px : 1px;
+    border-color: root.is-target ? #818cf8d9 : #ffffff24;
+
+    animate background { duration: 140ms; easing: ease-out; }
+    animate border-width { duration: 140ms; easing: ease-out; }
+    animate border-color { duration: 140ms; easing: ease-out; }
+
+    // Centered anchor reticle
+    Rectangle {
+        width: root.is-target ? 34px : 24px;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: root.is-target ? #818cf82e : #ffffff10;
+        border-width: 1px;
+        border-color: root.is-target ? #818cf899 : #ffffff24;
+
+        animate width { duration: 160ms; easing: ease-out-back; }
+        animate background { duration: 140ms; easing: ease-out; }
+        animate border-color { duration: 140ms; easing: ease-out; }
+
+        Rectangle {
+            width: root.is-target ? 10px : 6px;
+            height: self.width;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: self.width / 2;
+            background: root.is-target ? Theme.icon-accent : #ffffff40;
+
+            animate width { duration: 160ms; easing: ease-out-back; }
+            animate background { duration: 140ms; easing: ease-out; }
+        }
+    }
+}
+
+// Corner drop-zone targets shown beneath the dragged mini player tile (v2, §12.2).
+export component MiniCornerGuides inherits Rectangle {
+    in property <bool> active: false;
+    in property <MiniCorner> target-corner: MiniCorner.BottomRight;
+    in property <length> tile-width: Theme.mini-min-width;
+    in property <length> tile-height: 158px;
+
+    opacity: root.active ? 1.0 : 0.0;
+    visible: self.opacity > 0.01;
+    animate opacity { duration: root.active ? 120ms : 160ms; easing: ease-out; }
+
+    CornerGuideSlot {
+        x: Theme.mini-margin;
+        y: Theme.mini-top-margin;
+        width: root.tile-width;
+        height: root.tile-height;
+        is-target: root.target-corner == MiniCorner.TopLeft;
+    }
+
+    CornerGuideSlot {
+        x: parent.width - root.tile-width - Theme.mini-margin;
+        y: Theme.mini-top-margin;
+        width: root.tile-width;
+        height: root.tile-height;
+        is-target: root.target-corner == MiniCorner.TopRight;
+    }
+
+    CornerGuideSlot {
+        x: Theme.mini-margin;
+        y: parent.height - root.tile-height - Theme.mini-margin;
+        width: root.tile-width;
+        height: root.tile-height;
+        is-target: root.target-corner == MiniCorner.BottomLeft;
+    }
+
+    CornerGuideSlot {
+        x: parent.width - root.tile-width - Theme.mini-margin;
+        y: parent.height - root.tile-height - Theme.mini-margin;
+        width: root.tile-width;
+        height: root.tile-height;
+        is-target: root.target-corner == MiniCorner.BottomRight;
+    }
+}
