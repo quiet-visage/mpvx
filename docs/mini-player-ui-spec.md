@@ -1,6 +1,6 @@
 # Mini Player — UI, Motion & Technical Implementation Specification
 
-> **Document Status:** `IMPLEMENTED (Phase 0 + Phase 1)`; Phase 2 verification pending (Design, Motion, Performance & Rendering Specification)  
+> **Document Status:** `IMPLEMENTED (v1: Phase 0 + Phase 1; v2: Drag & Four-Corner Snapping, §12)`; Phase 2 verification pending (Design, Motion, Performance & Rendering Specification)  
 > **Related Specs:** [Video Picker UI Spec](video-picker-ui-spec.md) · [Main Media Controls UI Spec](main-media-controls-ui-spec.md)  
 > **Target Toolchain & Dependencies:** C++26, Slint `1.19.0` ([cmake/Dependencies.cmake](../cmake/Dependencies.cmake)), `libmpv` 2.5 software render API (`MPV_RENDER_API_TYPE_SW`, [src/renderer.cpp](../src/renderer.cpp))
 
@@ -130,7 +130,7 @@ Portrait video (`video-aspect < 1`): width is computed from a height cap instead
 
 ### 3.4 Picker Layout Adjustments
 - While the tile is showing, the picker main pane adds `padding-bottom: mini-h + 32px` so the last grid row and shelves can be scrolled clear of the tile. While the pill is showing, the inset is `40px + 32px`. The padding changes once at the start of each transition, never per frame.
-- The sidebar is not padded; the tile sits over the main pane only.
+- The sidebar is not padded; the tile sits over the main pane only. (v2 top corners instead push the whole picker, sidebar included, below the tile: `top-clearance`, §12.1.)
 - The top bar shows the picker layout (search, sort). Its existing **Return to Player** button stays and expands the tile.
 
 ### 3.5 Minimized State (Pill)
@@ -222,7 +222,7 @@ Collapsing needs no render-target change and no new video frames, because playba
 ### 4.5 Motion Rules (Normative)
 1. **Exactly one element moves:** the single persistent `VideoView`. It MUST NOT be recreated (no `if` swap) and MUST NOT be reparented.
 2. **No opacity on the picker during the morph.** Fading an element that has children may make Slint compose it through an offscreen layer every frame. The picker is revealed by the shrinking rect instead. The existing `picker-opacity` crossfade remains only for the no-video case.
-3. **No blurred shadow while geometry animates.** The shadow fades in only after settle (`mini-shadow`) and drops to 0 at the start of expand. A shadow whose size changes every frame is likely re-blurred every frame.
+3. **No blurred shadow while geometry animates.** The shadow fades in only after settle (`mini-shadow`) and drops to 0 at the start of expand. A shadow whose size changes every frame is likely re-blurred every frame. The one exception is v2 drag and corner snap (§12.2): the tile keeps its size and only translates, and the shadow keeps a fixed `24px` radius, so it never changes size. Any morph that resizes the tile (shrink, expand, collapse) still runs without it.
 4. **No layout-dependent children inside the moving rect.** `VideoView` children use absolute or percentage geometry only, so each animation frame is a pure transform.
 5. **Render target constant during any animation** (§2.3 rule 4).
 6. **Letterboxing is done by Slint, not mpv** (§7.2), so the frame's aspect ratio equals the tile's aspect ratio and no bars appear or vanish at settle.
@@ -650,11 +650,157 @@ Measured on the reference machine (§2.1) with a 1080p60 source.
 
 ---
 
-## 12. Future Work (v2+)
-- Drag the tile; snap to the nearest of four corners with a spring (`ease-out-back`, `240ms`).
+## 12. v2 Specification: Drag & Four-Corner Snapping (Plus Future Work)
+
+v2 adds tactile drag-to-reposition and spring-animated snapping to any of the four viewport corners while keeping v1's single-element `VideoView` architecture, constant render-target invariant (§2.3 rule 4), and §4.5 motion rules intact.
+
+### 12.1 Corner Model & Safe Dock Geometry
+
+```slint
+// ui/theme.slint
+export enum MiniCorner { BottomRight, BottomLeft, TopRight, TopLeft }
+```
+
+`BottomRight` remains the default on launch. The active `mini-corner` is **session-only** (not persisted across launches, matching §1.2) and survives `Player ↔ Picker`, `Tile ↔ Pill`, and all picker navigation (§3.7).
+
+Because `TopBar` (`height: 64px`, `top-bar-content-height: 56px`) sits at layer 5 *above* `VideoView` (layer 2) and `MiniPill` (layer 3) with a full-width `TouchArea` (`bar-touch`), top corners must clear `TopBar` completely so the top bar never intercepts pointer events or obscures the tile's `[⤢]` / `[✕]` buttons:
+
+```
+┌─────────────────────────────── window-shell ───────────────────────────────┐
+│  TopBar (56px content / 64px gradient — never overlapped by mini player)   │
+├────────────────────────────────────────────────────────────────────────────┤
+│  16px ╭──────────────╮                              ╭──────────────╮ 16px  │
+│  ───▶ │  TopLeft     │              │               │    TopRight  │ ◀───  │
+│       │  (16, 72)    │              │               │ (W-w-16, 72) │       │
+│       ╰──────────────╯              │               ╰──────────────╯       │
+│  ───────────────────────────────────┼────────────────────────────────────  │
+│                                     │  safe-area midpoint:                 │
+│                                     │  x = W / 2                           │
+│       ╭──────────────╮              │  y = (72 + H - 16) / 2               │
+│       │  BottomLeft  │              │               ╭──────────────╮       │
+│       │ (16, H-h-16) │              │               │ BottomRight  │       │
+│  16px ╰──────────────╯                              ╰──────────────╯ 16px  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Corner | Tile `(x, y)` | Pill `(x, y)` | Picker `bottom-inset` | Picker `top-clearance` |
+| :--- | :--- | :--- | :--- | :--- |
+| `TopLeft` | `(16px, 72px)` | `(16px, 72px)` | `0px` | `mini-h + 88px` (Tile) / `128px` (Pill) |
+| `TopRight` | `(W - mini-w - 16px, 72px)` | `(W - pill-w - 16px, 72px)` | `0px` | `mini-h + 88px` (Tile) / `128px` (Pill) |
+| `BottomLeft` | `(16px, H - mini-h - 16px)` | `(16px, H - 40px - 16px)` | `mini-h + 32px` (Tile) / `72px` (Pill) | `0px` |
+| `BottomRight` | `(W - mini-w - 16px, H - mini-h - 16px)` | `(W - pill-w - 16px, H - 40px - 16px)` | `mini-h + 32px` (Tile) / `72px` (Pill) | `0px` |
+
+- **Top margin:** `Theme.mini-top-margin` (`72px` = `top-bar-content-height + mini-margin`), matching the `16px` margin on left, right, and bottom.
+- **Drag clamping bounds:** while dragging, `(drag-x, drag-y)` is clamped to `[8px, max(8px, W - mini-w - 8px)]` horizontally (`Theme.mini-drag-edge-pad`) and `[64px, max(64px, H - mini-h - 8px)]` vertically (`Theme.mini-top-drag-edge-pad`). The `8px` edge pad gives a slight tactile over-drag cushion past the `16px` resting margin without entering `TopBar` (`64px`) or clipping outside `window-shell`.
+- **Picker `bottom-inset`:** applies only when `mini-corner` is at the bottom (`BottomLeft` or `BottomRight`), avoiding an unnecessary blank band at the bottom of the picker when the mini player is docked at the top.
+- **Picker `top-clearance`:** at a top corner, the whole picker (sidebar, breadcrumb bar and grid) starts below the tile or pill: `VideoPicker`'s top padding becomes `max(60px, top-clearance)`, where `top-clearance = 72px + (mini-h | 40px) + 16px` (`MainWindow.picker-top-clearance`). A scrollable inset like `bottom-inset` is not enough here, because the breadcrumb bar, the sidebar nav and the first row at scroll offset 0 cannot be scrolled out from under the tile. Like the bottom inset, it is not animated: it switches when `mini-corner` or `mini-state` changes (at drop, not during the drag), costing the picker about `mini-h + 28px` of height while docked at the top.
+
+### 12.2 Visual Design: Tile Chrome, Drag Lift & Corner Drop-Zone Guides
+
+#### Idle & Hover Tile Chrome (`MiniOverlay`)
+- **Subtle drag grip:** a `18×3px` capsule (`border-radius: 1.5px`, `#ffffff66`) at top-left (`x: 10px, y: 14px`) fades in alongside the hover scrim. Even on the narrowest clamped `0.5` portrait tile (`110px` wide at `220px` height), it sits `8px` clear of `[⤢]` (`x: 34px`).
+- **Unified hover fade:** `play-btn`, `expand-btn`, `close-btn`, the drag grip, and the `#00000066` scrim all fade together over `150ms ease-out` (`opacity` + `visible: self.opacity > 0.01`) instead of popping instantaneously.
+- **Cursors:** `MouseCursor.grab` over the draggable tile body, `MouseCursor.grabbing` while actively dragging, and `MouseCursor.pointer` over `[▶]`, `[⤢]`, `[✕]`.
+
+#### Active Drag Elevation ("Lift")
+When the user drags the tile past the threshold:
+1. **Unobstructed video:** the hover scrim, grip pill, and `[▶]` / `[⤢]` / `[✕]` buttons fade out (`150ms ease-out`) and disable hit-testing (`IconButton.interactive: false`, which blocks input without switching to the disabled icon colour mid-fade) so the playing video and the corner target behind it stay crystal clear. The `3px` progress bar remains visible.
+2. **Shadow lift (no re-blurring):** `drop-shadow-blur` stays constant at `24px` (so Slint never re-computes a varying blur radius per frame), while `drop-shadow-offset-y` animates `8px → 14px` and `drop-shadow-color` deepens `#00000099 → #000000cc` over `140ms ease-out`.
+3. **Accent ring:** the tile border transitions (`140ms ease-out`) from `1px Theme.card-border-hover` to `1.5px #818cf8d9` (matching `Theme.icon-accent`), easing through `#818cf880` during the snap spring back to `1px Theme.card-border` / `card-border-hover` on settle.
+
+#### Corner Drop-Zone Guides (`MiniCornerGuides`)
+While dragging (`mini-dragging && mini-state == Tile && !mini-closing`), a lightweight overlay drawn **between `VideoPicker` and `VideoView`** reveals the four snap slots (`mini-w × mini-h`, `Theme.card-radius`):
+
+```
+  ╭╌╌╌╌╌╌╌╌╌╌╌╌╌╌╮                      ╭──────────────╮
+  ┆      (•)     ┆   inactive slot      │  ┏━━━━━━━━┓  │  active target slot
+  ┆              ┆   #090a0f59 fill     │  ┃ ( ● )  ┃  │  #818cf822 wash
+  ╰╌╌╌╌╌╌╌╌╌╌╌╌╌╌╯   1px #ffffff24      │  ┗━━━━━━━━┛  │  1.5px #818cf8d9
+                                        ╰──────────────╯
+                    ┌─────────────────┐
+                    │   Dragged Tile  │  ← floats above guides (14px shadow, 1.5px #818cf8d9)
+                    │▓▓▓▓▓▓▓░░░░░░░░░░│
+                    └─────────────────┘
+```
+
+- **Visibility & fade:** fades in over `120ms ease-out` on drag start and fades out over `160ms ease-out` on release (`visible: self.opacity > 0.01`, so zero render/hit-test cost when idle).
+- **Inactive slots (3 corners):** `#090a0f59` translucent backdrop, `1px #ffffff24` border, centered `24×24px` ring (`#ffffff10` fill, `1px #ffffff24` border) with a `6×6px` `#ffffff40` center dot.
+- **Active target slot (nearest corner):** as the dragged tile crosses the safe-area midpoint, the target slot smoothly transitions (`140ms ease-out`) to `#818cf822` fill and `1.5px #818cf8d9` glowing border, while its centered reticle expands (`24px → 34px` ring `#818cf82e` / `#818cf899`, `6px → 10px` dot `Theme.icon-accent`) with `160ms ease-out-back`.
+
+### 12.3 Gesture & Click-vs-Drag Discrimination
+
+1. **Button isolation:** `[▶]`, `[⤢]`, and `[✕]` `IconButton`s sit as siblings *above* `body-touch` in `MiniOverlay`, so pressing any button never starts a tile drag.
+2. **Threshold:** drag begins only on left-button press (`PointerEventButton.left`) once pointer displacement reaches `Theme.mini-drag-threshold` (`6px` Euclidean: `dx² + dy² ≥ 36px²`). Sub-threshold clicks expand to the full player as in v1. Pressing another button mid-drag is ignored. Releasing another button ends the drag (snap to `nearest-corner`, no expand), because Slint ends the pointer grab on any button release and the tile could no longer follow the pointer once it left the tile.
+3. **Zero-drift `TouchArea` tracking:** because `body-touch` moves with `VideoView`, `tile-x + (mouse-x - pressed-x)` simplifies algebraically to `pointer_window_x - pressed_x`, keeping the grabbed pixel locked to the cursor with zero drift even when clamping at viewport edges. This holds only while the tile moves solely with the pointer, which is why a press freezes any snap in flight (item 5).
+4. **Release click suppression:** `did-drag` is set when threshold is crossed and cleared on `PointerEventKind.down` (and after suppressing `clicked`). Regardless of whether Slint dispatches `pointer-event(up)` or `clicked` first, releasing after a drag **never** triggers `expand-clicked()`.
+5. **Mid-snap re-grab:** a left press while a snap spring is still in flight (`press-started`) immediately cancels `snap-settle-timer`, captures the live interpolated `(tile-x, tile-y)` into `(mini-drag-x, mini-drag-y)`, clears `mini-snapping` and pins the tile there (`mini-held`). Freezing at the press, not at the threshold, matters: otherwise the spring's own motion between press and move counts toward the `6px` threshold and is added to the drag, making the tile jump. Dragging past `6px` then resumes 1:1 tracking from the pinned position; releasing without dragging (`press-released`) is a click and restarts the snap from where the tile was frozen.
+6. **Drag waits for the shrink:** `body-touch` only arms a drag once `mini-t == 1.0`. `MiniOverlay` appears at `mini-t >= 0.95`, but until the morph ends the drawn rect is `m-x * mini-t` and still resizing, so a drag seeded from the resting position would jump away from the cursor. Clicks still expand during that window.
+
+### 12.4 Transition Choreography & Curves
+
+#### A. Drag Start (`0–150 ms`)
+
+| t | Event |
+| :--- | :--- |
+| 0 ms | Threshold (`6px`) crossed. `snap-settle-timer` stopped; live `(tile-x, tile-y)` copied to `(mini-drag-x, mini-drag-y)`; `mini-snapping = false`, `mini-dragging = true`. Tile tracks pointer 1:1 (`0ms` lag). |
+| 0–120 ms | `MiniCornerGuides` fades in (`opacity: 0 → 1`, `ease-out`); current nearest corner lights up. |
+| 0–140 ms | Tile lifts: `drop-shadow-offset-y` `8px → 14px`, shadow deepens `#00000099 → #000000cc`, border shifts to `1.5px #818cf8d9`. |
+| 0–150 ms | Hover scrim, grip pill, and overlay buttons fade out (`opacity → 0`). |
+
+#### B. Release → Corner Snap (`0–240 ms`)
+
+| t | Event |
+| :--- | :--- |
+| 0 ms | Pointer released (`up` / `cancel`). `mini-corner` updates to `nearest-corner(mini-drag-x, mini-drag-y)` (comparing tile center against `(W/2, (72 + H - 16)/2)`). `mini-snapping = true`, `mini-dragging = false`; `snap-settle-timer` (`240ms + 20ms`) armed. |
+| 0–140 ms | Shadow settles (`14px → 8px`, `#000000cc → #00000099`); border eases toward `#818cf880` and back to hover/idle color. |
+| 0–160 ms | `MiniCornerGuides` fades out (`opacity: 1 → 0`, `ease-out`). |
+| 0–240 ms | `tile-x` and `tile-y` animate from `(mini-drag-x, mini-drag-y)` to `(target-tile-x, target-tile-y)` with a tuned spring curve (`cubic-bezier(0.22, 1.25, 0.36, 1)`). |
+| 260 ms | `snap-settle-timer` fires and sets `mini-snapping = false`, restoring `0ms` position binding so subsequent window resizes stick immediately to the corner. |
+
+> **Why `cubic-bezier(0.22, 1.25, 0.36, 1)` instead of raw CSS `ease-out-back` (`cubic-bezier(0.34, 1.56, 0.64, 1)`):** Standard `ease-out-back` overshoots by ~10.5%. On a `900px` cross-window throw, a 10.5% overshoot pushes the tile ~`95px` past the `16px` margin, clipping half the video off `window-shell`. Tuning the curve to `cubic-bezier(0.22, 1.25, 0.36, 1)` yields a crisp ~2% overshoot (`~18px` max on a full-width throw, `~3–6px` on nearby snaps) that stays clear of the window frame on typical windows. Because the overshoot scales with travel, while `mini-snapping` the drawn position (`shown-tile-x/y`, also exposed as `mini-tile-x/y`) is clamped to the drag pads (`8px` sides, `64px` top), so a ~`1000px` throw in a `2560px` window flattens against the pad instead of clipping the tile at the window edge or slipping under `TopBar`.
+
+#### C. Corner-Aware `Player ↔ Tile`, `Tile ↔ Pill`, and Interruptions
+- **`Player ↔ Tile` (`mini-t`):** shrinks to and expands from `(tile-x, tile-y)` of `mini-corner` (`300ms` / `260ms ease-out-expo`).
+- **`Tile ↔ Pill` (`collapse-t`):** collapses to and restores from `(pill-x, pill-y)` in the **same** `mini-corner` (`220ms ease-in-out-cubic`), pinning the outer corner during collapse.
+- **`Pill → Player` (`⤢`, `Esc`):** expands smoothly from `mini-corner`'s pill rect to full screen (`260ms ease-out-expo`).
+- **Minimize mid-drag / mid-snap (`✕`, `Ctrl+W`):** commits `nearest-corner` (if dragging), clears `mini-dragging`, sets `mini-snapping = true` (`snap-settle-timer` armed), and collapses cleanly into `MiniPill` at that corner.
+- **Expand mid-drag / mid-snap (`Esc`, Return to Player, card click):** `changed mini-state` pins the tile at its current position (`mini-held`), clears `mini-dragging` and `mini-snapping`, and commits no corner (`mini-corner` is unchanged). The drag shadow drops immediately (`drop-shadow-blur: 0px`, §4.5 rule 3) and `VideoView` morphs straight from its current position to full screen. `mini-held` clears the next time `mini-state` becomes `Tile`.
+- **Idle close mid-drag (`mini-closing`):** clears `mini-dragging` and fades out in place (`160ms`).
+- **Normative §4.5 compliance:** the mpv render target never changes during drag or snap (all 4 corners share `mini-w × mini-h`); `VideoView` is never recreated or reparented; `MiniOverlay` stays mounted across drag and snap because `mini-chrome-visible` remains true; `drop-shadow-blur` never animates its radius. The `24px` shadow stays on through drag and snap (`Tile`, not closing) so the lift eases out over the snap even when the drag began before the settled shadow (`mini-shadow == 0`); this is the translation-only exception in §4.5 rule 3.
+
+### 12.5 Slint Additions, Edge Cases & Verification Plan
+
+#### Theme Tokens & `MainWindow` Interface
+- **New `Theme` tokens (`ui/theme.slint`):** `mini-snap-duration: 240ms`, `mini-top-margin: 72px`, `mini-drag-threshold: 6px`, `mini-drag-edge-pad: 8px`, `mini-top-drag-edge-pad: 64px`.
+- **`MainWindow` (`ui/app-window.slint`):** `in-out property <MiniCorner> mini-corner: BottomRight`, `out property <bool> mini-dragging`, `out property <bool> mini-snapping`, `out property <length> mini-tile-x/y`, `out property <length> mini-pill-x/y`, plus `corner-x`, `corner-y`, `nearest-corner` helpers and `snap-settle-timer`.
+- **C++ backend (`src/main.cpp`):** **zero changes required** to `MiniPlayerController`, because render-target sizing (`mini-w`, `mini-h`) is invariant across all four corners.
+
+#### v2 Edge Cases
+
+| Case | Behaviour |
+| :--- | :--- |
+| Drag while paused or at EOF | Identical drag, corner guides, and spring snap; last paused frame stays sharp with no re-render. |
+| Drag while buffering | `28px` spinner remains centered inside the moving tile. |
+| Right- or middle-button drag | Ignored; only `PointerEventButton.left` initiates drag. Pressing one mid-drag is ignored; releasing one ends the drag with a snap and the later left release does not expand (§12.3.2). |
+| Press during the shrink morph | Click expands; drag is not armed until `mini-t == 1.0` (§12.3.6). |
+| Pointer `cancel` or window leave while pressed | Treated identically to `up`: snaps cleanly to `nearest-corner` and clears `mini-dragging`. |
+| Window resized while docked in any corner | `0ms` binding keeps the tile pinned to its corner (`16px` / `72px` margins). |
+| Portrait (`9:16`) or extreme (`0.5`–`3.0`) aspect | Guides and corners use `mini-w × mini-h` directly; `18px` top-left grip clears `[⤢]` on `110px` min width. |
+| Smallest window (`640×360`) | `mini-w = 280px`, `mini-h = 157.5px`; horizontal gap between left/right slots is `48px`, vertical gap is `114.5px` — all 4 slots remain distinct and non-overlapping. |
+
+#### v2 Test & Motion QA Plan (`tests/test_mini_player_ui.cpp`)
+1. Sub-threshold pointer movement (`< 6px`) invokes `mini-expand-clicked` and does not set `mini-dragging`.
+2. Dragging past `6px` into each quadrant sets `mini-dragging == true`, suppresses `mini-expand-clicked` on release, sets `mini-corner` to the nearest of `{TopLeft, TopRight, BottomLeft, BottomRight}`, clamps within `[8px, 64px]` drag pads, and settles to exact corner coordinates after `240ms`.
+3. Re-grabbing the tile mid-snap (`~90ms` after release) cancels `mini-snapping`, enters `mini-dragging` without position jump, and snaps to the newly targeted corner. Pressing mid-snap and holding still keeps the tile frozen with time advancing; sub-threshold jitter does not start a drag; a drag after a pause moves the tile by exactly the pointer delta.
+3a. Right/middle buttons mid-drag never leave the tile stuck or expand; the tile cannot be dragged while `mini-t < 1`; the snap overshoot stays within the drag pads on a `2560px` window; expanding mid-drag keeps `mini-corner` and starts from the dragged position.
+4. `MiniPill` position, `picker-bottom-inset` (`0px` at top corners, `mini-h + 32px` / `72px` at bottom corners), and window resize anchoring all follow `mini-corner`.
+5. Interrupting an active drag with expand (`Hidden` / `Player`) or minimize (`Pill`) clears `mini-dragging` and transitions cleanly.
+6. Manual 60 fps motion QA: verify corner guide fade, lift shadow, spring overshoot clearance against `window-shell` edges, and `Tile ↔ Pill` collapse in all 4 corners.
+
+### 12.6 Remaining Future Work (v2+)
 - Compact audio-only pill (reusing `MiniPill` for audio-only playback).
 - Live Continue Watching progress for the playing item.
-- A persistent settings store (`$XDG_CONFIG_HOME/mpvx/`) so the 30 fps cap, along with hwdec, speed and aspect, survives restarts.
+- A persistent settings store (`$XDG_CONFIG_HOME/mpvx/`) so the 30 fps cap and preferred `mini-corner`, along with hwdec, speed and aspect, survive restarts.
 - mpv OpenGL render API with Slint's rendering notifier and borrowed GL textures: zero-copy frames, removing the copy-back and upload costs behind the §2.3 floor.
 
 ## 13. Open Questions
