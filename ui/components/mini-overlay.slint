@@ -1,0 +1,100 @@
+import { Theme } from "../theme.slint";
+import { IconButton } from "icon-button.slint";
+
+// Chrome for the settled mini player tile (docs/mini-player-ui-spec.md §3.2).
+// Shown only after the morph settles, so it is never composited during an animation.
+// All geometry is absolute (no layouts), per §4.5 rule 4.
+export component MiniOverlay inherits Rectangle {
+    in property <bool> is-playing: false;
+    in property <float> progress: 0.0;
+    in property <string> media-title: "";
+    in property <length> corner-radius: Theme.card-radius;
+
+    callback play-pause-clicked();
+    callback expand-clicked();
+    callback minimize-clicked();
+
+    property <bool> hovered: body-touch.has-hover || play-btn.has-hover || expand-btn.has-hover || close-btn.has-hover;
+
+    accessible-role: button;
+    accessible-label: "Mini player: " + root.media-title + ". Activate to expand.";
+    accessible-action-default => { root.expand-clicked(); }
+
+    // Body: click (and double-click) expands. The buttons are children so hovering them
+    // keeps the tile hovered.
+    body-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.expand-clicked(); }
+
+        // Hover scrim
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.mini-scrim;
+            opacity: root.hovered ? 1.0 : 0.0;
+            animate opacity { duration: 150ms; easing: ease-out; }
+        }
+
+        // Centre play/pause (44px circle)
+        play-btn := IconButton {
+            width: 44px;
+            height: 44px;
+            border-radius: 22px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            visible: root.hovered;
+            icon: root.is-playing ? @image-url("../assets/icons/pause.svg") : @image-url("../assets/icons/play.svg");
+            tooltip: root.is-playing ? "Pause" : "Play";
+            clicked => { root.play-pause-clicked(); }
+        }
+
+        // Top-right: expand, then pause + minimize
+        expand-btn := IconButton {
+            x: parent.width - 2 * self.width - 8px;
+            y: 6px;
+            visible: root.hovered;
+            icon: @image-url("../assets/icons/maximize-2.svg");
+            tooltip: "Expand";
+            clicked => { root.expand-clicked(); }
+        }
+
+        close-btn := IconButton {
+            x: parent.width - self.width - 6px;
+            y: 6px;
+            visible: root.hovered;
+            icon: @image-url("../assets/icons/x.svg");
+            tooltip: "Pause and minimize";
+            clicked => { root.minimize-clicked(); }
+        }
+    }
+
+    // 3px progress line: the only always-visible chrome
+    Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: 100%;
+        height: 3px;
+        background: Theme.progress-track;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width * clamp(root.progress, 0.0, 1.0);
+            height: 100%;
+            background: Theme.progress-fill;
+        }
+    }
+
+    // 1px border ring, brighter on hover
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        border-radius: root.corner-radius;
+        border-width: 1px;
+        border-color: root.hovered ? Theme.card-border-hover : Theme.card-border;
+        animate border-color { duration: 150ms; easing: ease-out; }
+    }
+}

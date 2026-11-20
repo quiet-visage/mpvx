@@ -1,0 +1,72 @@
+import { Theme } from "../theme.slint";
+import { IconButton } from "icon-button.slint";
+
+// Minimized mini player (docs/mini-player-ui-spec.md §3.5). Playback is always paused
+// while the pill is showing.
+export component MiniPill inherits Rectangle {
+    in property <string> title: "";
+
+    // Width the pill wants for its title, clamped to the token range (§3.5).
+    out property <length> ideal-width: clamp(title-measure.preferred-width + 96px, Theme.mini-pill-min-width, Theme.mini-pill-max-width);
+
+    callback restore-clicked();   // body / title: restore the tile, still paused
+    callback play-clicked();      // ▶: resume and restore the tile
+    callback expand-clicked();    // ⤢: straight to the full player, still paused
+
+    height: Theme.mini-pill-height;
+    border-radius: Theme.mini-pill-radius;
+    background: Theme.popover-bg;
+    border-width: 1px;
+    border-color: Theme.popover-border;
+
+    accessible-role: button;
+    accessible-label: "Mini player minimized: " + root.title + ". Activate to restore.";
+    accessible-action-default => { root.restore-clicked(); }
+
+    // Unconstrained copy of the title, used only to measure its natural width.
+    title-measure := Text {
+        visible: false;
+        text: root.title;
+        font-size: 13px;
+    }
+
+    body-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.restore-clicked(); }
+
+        IconButton {
+            x: 6px;
+            y: (parent.height - self.height) / 2;
+            width: 28px;
+            height: 28px;
+            border-radius: 14px;
+            icon: @image-url("../assets/icons/play.svg");
+            tooltip: "Resume";
+            clicked => { root.play-clicked(); }
+        }
+
+        title-text := Text {
+            x: 42px;
+            width: parent.width - 42px - 44px;
+            height: 100%;
+            text: root.title;
+            font-size: 13px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        IconButton {
+            x: parent.width - self.width - 6px;
+            y: (parent.height - self.height) / 2;
+            width: 28px;
+            height: 28px;
+            border-radius: 14px;
+            icon: @image-url("../assets/icons/maximize-2.svg");
+            tooltip: "Expand";
+            clicked => { root.expand-clicked(); }
+        }
+    }
+}

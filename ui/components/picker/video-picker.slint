@@ -22,6 +22,8 @@ export component VideoPicker inherits Rectangle {
     in property <[ShelfSection]> shelves: [];
     in property <bool> scanning: false;
     in property <string> search-query: "";
+    // Extra bottom padding so content can scroll clear of the mini player (not animated).
+    in property <length> bottom-inset: 0px;
 
     callback nav-selected(PickerNavKind, string /* path */);
     callback folder-toggled(string /* path */);
@@ -163,13 +165,16 @@ export component VideoPicker inherits Rectangle {
                     vertical-stretch: 1;
 
                     for grid-row in root.direct-video-rows : Rectangle {
-                        height: main-pane.dynamic-card-width * 9 / 16 + 70px;
+                        // The last row carries the mini player inset so it can scroll clear of the tile.
+                        height: main-pane.dynamic-card-width * 9 / 16 + 70px
+                            + (grid-row.row-index == root.direct-video-rows.length - 1 ? root.bottom-inset : 0px);
                         background: transparent;
 
                         HorizontalLayout {
                             x: 0px;
                             y: 0px;
                             width: 100%;
+                            height: main-pane.dynamic-card-width * 9 / 16 + 70px;
                             spacing: 16px;
                             alignment: start;
 
@@ -194,7 +199,7 @@ export component VideoPicker inherits Rectangle {
                     || (root.active-nav-kind == PickerNavKind.Home && root.continue-watching.length > 0) : Flickable {
                     vertical-stretch: 1;
                     content-width: self.width;
-                    content-height: mixed-col.preferred-height;
+                    content-height: mixed-col.preferred-height + root.bottom-inset;
 
                     mixed-col := VerticalLayout {
                         x: 0px;

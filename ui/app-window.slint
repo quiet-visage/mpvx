@@ -6,6 +6,7 @@ import {
     TrackItem,
     ChapterItem,
     AppViewMode,
+    MiniState,
     PickerNavKind,
     PickerSortMode,
     VideoEntry,
@@ -18,8 +19,11 @@ import { TopBar } from "components/top-bar.slint";
 import { ControlsBar } from "components/controls.slint";
 import { PopoverLayer } from "components/popovers.slint";
 import { VideoPicker } from "components/picker/video-picker.slint";
+import { MiniPill } from "components/mini-pill.slint";
 
 export {
+    Theme,
+    MiniState,
     LoopMode,
     AbLoopState,
     ActivePopover,
@@ -93,6 +97,56 @@ export component MainWindow inherits Window {
     property <float> picker-opacity: root.view-mode == AppViewMode.Picker ? 1.0 : 0.0;
     animate picker-opacity { duration: 220ms; easing: ease-out; }
 
+    // --- Mini Player State (docs/mini-player-ui-spec.md §5, §6.2) ---
+    // view-mode and mini-state are always assigned together by C++; Player + Tile/Pill is invalid.
+    in-out property <MiniState> mini-state: MiniState.Hidden;
+    out property <bool> mini-active: root.mini-state != MiniState.Hidden;
+    in property <float> video-aspect: 16 / 9;      // display aspect from mpv; 16/9 until known
+    in property <float> mini-shadow: 0.0;          // 0..1, C++ sets 1 after settle, 0 at motion start
+    in property <bool> mini-closing: false;        // playback went idle: fade the tile/pill out in place
+    in-out property <bool> mini-fps-cap: false;    // opt-in 30 fps cap, session-only (§3.6)
+
+    property <float> mini-aspect: clamp(root.video-aspect, 0.5, 3.0);
+    // Landscape: width from the window width. Portrait: height from the window height (§3.1).
+    property <bool> mini-portrait: root.mini-aspect < 1.0;
+    property <length> mini-landscape-w: clamp(root.width * Theme.mini-width-ratio, Theme.mini-min-width, Theme.mini-max-width);
+    property <length> mini-portrait-h: clamp(root.height * Theme.mini-portrait-height-ratio, Theme.mini-portrait-min-height, Theme.mini-portrait-max-height);
+    out property <length> mini-w: root.mini-portrait ? root.mini-portrait-h * root.mini-aspect : root.mini-landscape-w;
+    out property <length> mini-h: root.mini-portrait ? root.mini-portrait-h : root.mini-landscape-w / root.mini-aspect;
+    out property <length> pill-w: mini-pill.ideal-width;
+    out property <length> picker-bottom-inset: root.mini-state == MiniState.Tile ? root.mini-h + 2 * Theme.mini-margin
+        : root.mini-state == MiniState.Pill ? Theme.mini-pill-height + 2 * Theme.mini-margin
+        : 0px;
+
+    // Player <-> mini morph (§4.1, §4.2)
+    out property <float> mini-t: root.mini-active ? 1.0 : 0.0;
+    animate mini-t {
+        duration: root.mini-active ? Theme.mini-shrink-duration : Theme.mini-expand-duration;
+        easing: ease-out-expo;
+    }
+
+    // Tile <-> pill collapse (§4.4)
+    out property <float> collapse-t: root.mini-state == MiniState.Pill ? 1.0 : 0.0;
+    animate collapse-t {
+        duration: Theme.mini-collapse-duration;
+        easing: cubic-bezier(0.65, 0, 0.35, 1); // ease-in-out-cubic
+    }
+
+    // A morph is running or the mini player is up: the picker stays fully opaque beneath
+    // the moving video (no opacity layer on the picker, §4.5 rule 2).
+    property <bool> morphing: root.mini-active || root.mini-t > 0.001;
+
+    // Idle/error dismissal fade (§8); animated only on the way out.
+    property <float> close-fade: root.mini-closing ? 0.0 : 1.0;
+    animate close-fade { duration: root.mini-closing ? Theme.mini-close-fade-duration : 0ms; }
+
+    // Settled shadow fade-in (§4.5 rule 3): fades in over 160ms, drops instantly.
+    property <float> shadow-k: root.mini-shadow;
+    animate shadow-k { duration: root.mini-shadow > 0.5 ? 160ms : 0ms; }
+
+    changed mini-w => { root.mini-geometry-changed(); }
+    changed mini-h => { root.mini-geometry-changed(); }
+
     // --- Window & HUD State ---
     in-out property <bool> is-fullscreen: false;
     in-out property <bool> is-maximized: false;
@@ -152,6 +206,13 @@ export component MainWindow inherits Window {
     callback return-to-picker-clicked();
     callback return-to-player-clicked();
 
+    // --- Mini Player Callbacks ---
+    callback mini-expand-clicked();
+    callback mini-minimize-clicked();                   // ✕ / Ctrl+W: pause + collapse to pill
+    callback mini-restore-clicked(bool /* resume */);   // pill body (false) or ▶ / Space (true)
+    callback mini-geometry-changed();                   // tile size changed; C++ reads mini-w/h
+    callback mini-fps-cap-changed(bool);
+
     function reset-hud-timer() {
         root.pointer-idle-ms = 0;
         root.hud-visible = true;
@@ -179,6 +240,21 @@ export component MainWindow inherits Window {
     changed active-popover => {
         if (root.active-popover != ActivePopover.OpenUrlModal) {
             key-scope.focus();
+        }
+    }
+
+    // Expand click guard (§3.3): after leaving mini mode for the player, swallow clicks on the
+    // video for one double-click interval. Otherwise the second click of a double-click on
+    // the tile lands on the full player (mini-mode drops within ~30ms of the expand) and
+    // toggles pause and fullscreen.
+    expand-click-guard := Timer {
+        interval: Theme.mini-expand-click-guard;
+        running: false;
+        triggered => { self.running = false; }
+    }
+    changed mini-active => {
+        if (!root.mini-active && root.view-mode == AppViewMode.Player) {
+            expand-click-guard.running = true;
         }
     }
 
@@ -216,38 +292,15 @@ export component MainWindow inherits Window {
             root.viewport-resized(Math.round(self.width / 1px), Math.round(self.height / 1px));
         }
 
-        // 1. Full-Bleed Video Canvas
-        video-view := VideoView {
-            x: 0px;
-            y: 0px;
-            width: 100%;
-            height: 100%;
-            video-frame: root.video-frame;
-            has-video: root.has-video;
-            is-playing: root.is-playing;
-            is-buffering: root.is-buffering || (root.has-video && controls-bar.is-scrubbing);
-            hud-visible: root.hud-visible || root.hud-locked;
-
-            pointer-activity => { root.reset-hud-timer(); }
-            single-clicked => {
-                if (root.active-popover != ActivePopover.None) {
-                    root.active-popover = ActivePopover.None;
-                } else if (root.has-video) {
-                    root.play-pause-clicked();
-                }
-            }
-            double-clicked => { root.fullscreen-toggled(); }
-            open-clicked => { root.open-file-clicked(); }
-        }
-
-        // 1.5 Video Picker Library Layer (Crossfade over VideoView)
+        // 1. Video Picker Library Layer (beneath the video so the shrinking rect reveals it)
         VideoPicker {
-            visible: root.view-mode == AppViewMode.Picker || root.picker-opacity > 0.01;
+            visible: root.view-mode == AppViewMode.Picker || root.morphing || root.picker-opacity > 0.01;
             x: 0px;
             y: 0px;
             width: 100%;
             height: 100%;
-            opacity: root.picker-opacity;
+            opacity: root.morphing ? 1.0 : root.picker-opacity;
+            bottom-inset: root.picker-bottom-inset;
             sidebar-open: root.sidebar-open;
             active-nav-kind: root.active-nav-kind;
             folders: root.picker-folders;
@@ -271,7 +324,81 @@ export component MainWindow inherits Window {
             open-folder-clicked => { root.picker-open-external-folder(); }
         }
 
-        // 2. Backdrop Dismissal Layer for Active Popovers
+        // 2. Video Canvas: full-bleed in the player, morphs into the mini tile/pill (§6.3).
+        // The single persistent moving element: never recreated, never reparented (§4.5 rule 1).
+        video-view := VideoView {
+            // Tile rect
+            property <length> tile-x: window-shell.width - root.mini-w - Theme.mini-margin;
+            property <length> tile-y: window-shell.height - root.mini-h - Theme.mini-margin;
+            // Pill rect
+            property <length> pill-x: window-shell.width - root.pill-w - Theme.mini-margin;
+            property <length> pill-y: window-shell.height - Theme.mini-pill-height - Theme.mini-margin;
+            // Mini rect = tile rect interpolated toward the pill rect by collapse-t
+            property <length> m-x: self.tile-x + (self.pill-x - self.tile-x) * root.collapse-t;
+            property <length> m-y: self.tile-y + (self.pill-y - self.tile-y) * root.collapse-t;
+            property <length> m-w: root.mini-w + (root.pill-w - root.mini-w) * root.collapse-t;
+            property <length> m-h: root.mini-h + (Theme.mini-pill-height - root.mini-h) * root.collapse-t;
+
+            // Full window rect interpolated toward the mini rect by mini-t
+            x: self.m-x * root.mini-t;
+            y: self.m-y * root.mini-t;
+            width: window-shell.width + (self.m-w - window-shell.width) * root.mini-t;
+            height: window-shell.height + (self.m-h - window-shell.height) * root.mini-t;
+            border-radius: (Theme.card-radius + (Theme.mini-pill-radius - Theme.card-radius) * root.collapse-t) * root.mini-t;
+
+            drop-shadow-blur: root.shadow-k > 0.0 ? 24px : 0px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: #00000099.transparentize(1.0 - root.shadow-k);
+
+            // Outside a morph, VideoView fades in over the picker (plain crossfade when no
+            // mini player is involved, e.g. opening a file from an empty picker).
+            visible: (root.view-mode == AppViewMode.Player || root.mini-active || root.picker-opacity < 0.99)
+                  && root.collapse-t < 0.999;
+            opacity: root.close-fade * (root.morphing ? 1.0 : 1.0 - root.picker-opacity);
+
+            video-frame: root.video-frame;
+            has-video: root.has-video;
+            is-playing: root.is-playing;
+            is-buffering: root.is-buffering || (root.has-video && controls-bar.is-scrubbing);
+            hud-visible: root.hud-visible || root.hud-locked;
+            mini-mode: root.mini-t > 0.5;
+            suppress-clicks: expand-click-guard.running;
+            mini-chrome-visible: root.mini-state == MiniState.Tile && root.mini-t >= 0.95 && root.collapse-t == 0.0 && !root.mini-closing;
+            progress: root.progress;
+            media-title: root.media-title;
+
+            pointer-activity => { root.reset-hud-timer(); }
+            single-clicked => {
+                if (root.active-popover != ActivePopover.None) {
+                    root.active-popover = ActivePopover.None;
+                } else if (root.has-video) {
+                    root.play-pause-clicked();
+                }
+            }
+            double-clicked => { root.fullscreen-toggled(); }
+            open-clicked => { root.open-file-clicked(); }
+            expand-clicked => { root.mini-expand-clicked(); }
+            mini-play-pause-clicked => { root.play-pause-clicked(); }
+            mini-minimize-clicked => { root.mini-minimize-clicked(); }
+        }
+
+        // 3. Minimized mini player, drawn above the video so it covers the collapsing tile (§4.4)
+        mini-pill := MiniPill {
+            x: video-view.pill-x;
+            y: video-view.pill-y;
+            width: root.pill-w;
+            // Expanding from the pill (view-mode becomes Player) keeps it drawn while it fades
+            // out over the combined morph (§6.3). After an idle close (still Picker, no longer
+            // mini) collapse-t also runs back to 0, but the pill must not reappear then.
+            visible: root.collapse-t > 0.001 && (root.mini-active || root.view-mode == AppViewMode.Player);
+            opacity: root.close-fade * clamp((root.collapse-t - 0.4) / 0.6, 0.0, 1.0);
+            title: root.media-title;
+            restore-clicked => { root.mini-restore-clicked(false); }
+            play-clicked => { root.mini-restore-clicked(true); }
+            expand-clicked => { root.mini-expand-clicked(); }
+        }
+
+        // 4. Backdrop Dismissal Layer for Active Popovers
         if root.active-popover != ActivePopover.None : TouchArea {
             x: 0px;
             y: 0px;
@@ -283,7 +410,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 3. Top Gradient Overlay Bar (64px)
+        // 5. Top Gradient Overlay Bar (64px)
         top-bar := TopBar {
             x: 0px;
             y: 0px;
@@ -312,7 +439,7 @@ export component MainWindow inherits Window {
             picker-sort-changed(m) => { root.picker-sort-changed(m); }
         }
 
-        // 4. Bottom Gradient Overlay Bar (104px)
+        // 6. Bottom Gradient Overlay Bar (104px)
         controls-bar := ControlsBar {
             x: 0px;
             y: parent.height - self.height;
@@ -347,7 +474,7 @@ export component MainWindow inherits Window {
             seek-requested(pos) => { root.seek-requested(pos); }
         }
 
-        // 5. Floating Glassmorphic Popovers
+        // 7. Floating Glassmorphic Popovers
         PopoverLayer {
             x: 0px;
             y: 0px;
@@ -361,6 +488,7 @@ export component MainWindow inherits Window {
             playback-speed <=> root.playback-speed;
             hwdec-mode <=> root.hwdec-mode;
             aspect-ratio <=> root.aspect-ratio;
+            mini-fps-cap <=> root.mini-fps-cap;
             media-title: root.media-title;
 
             open-file-clicked => { root.open-file-clicked(); }
@@ -372,6 +500,7 @@ export component MainWindow inherits Window {
             speed-changed(s) => { root.speed-changed(s); }
             hwdec-changed(m) => { root.hwdec-changed(m); }
             aspect-changed(a) => { root.aspect-changed(a); }
+            mini-fps-cap-changed(enabled) => { root.mini-fps-cap-changed(enabled); }
         }
 
         // Subtle 1px outer border ring in windowed mode
@@ -387,7 +516,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    // 6. Keyboard Shortcuts Handler (when URL modal text input is not active)
+    // Keyboard Shortcuts Handler (when URL modal text input is not active)
     key-scope := FocusScope {
         width: 0px;
         height: 0px;
@@ -403,6 +532,20 @@ export component MainWindow inherits Window {
                 }
                 if (event.text == "/" || (event.modifiers.control && (event.text == "f" || event.text == "F"))) {
                     top-bar.focus-search();
+                    return accept;
+                }
+                if (event.text == " " && !top-bar.search-focused) {
+                    if (root.mini-state == MiniState.Tile) {
+                        root.play-pause-clicked();
+                        return accept;
+                    } else if (root.mini-state == MiniState.Pill) {
+                        root.mini-restore-clicked(true);
+                        return accept;
+                    }
+                }
+                if (event.modifiers.control && (event.text == "w" || event.text == "W")
+                        && root.mini-state == MiniState.Tile) {
+                    root.mini-minimize-clicked();
                     return accept;
                 }
                 if (event.text == Key.Backspace && !top-bar.search-focused) {

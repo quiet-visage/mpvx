@@ -1,4 +1,5 @@
 import { Theme } from "../theme.slint";
+import { MiniOverlay } from "mini-overlay.slint";
 
 export component VideoView inherits Rectangle {
     in property <image> video-frame;
@@ -7,10 +8,20 @@ export component VideoView inherits Rectangle {
     in property <bool> is-buffering: false;
     in property <bool> hud-visible: true;
 
+    // Mini player (docs/mini-player-ui-spec.md §6.4)
+    in property <bool> mini-mode: false;          // tile-sized: click expands, no placeholder
+    in property <bool> mini-chrome-visible: false; // settled tile: show MiniOverlay
+    in property <float> progress: 0.0;
+    in property <string> media-title: "";
+    in property <bool> suppress-clicks: false;     // just expanded from mini: swallow clicks
+
     callback single-clicked();
     callback double-clicked();
     callback open-clicked();
     callback pointer-activity();
+    callback expand-clicked();
+    callback mini-play-pause-clicked();
+    callback mini-minimize-clicked();
 
     background: Theme.canvas-bg;
     clip: true;
@@ -26,16 +37,27 @@ export component VideoView inherits Rectangle {
     viewport-touch := TouchArea {
         width: 100%;
         height: 100%;
-        mouse-cursor: (root.is-playing && !root.hud-visible) ? MouseCursor.none : MouseCursor.default;
+        mouse-cursor: root.mini-mode ? MouseCursor.pointer
+                    : (root.is-playing && !root.hud-visible) ? MouseCursor.none
+                    : MouseCursor.default;
 
         clicked => {
             root.pointer-activity();
-            root.single-clicked();
+            if (root.suppress-clicks) {
+                return;
+            }
+            if (root.mini-mode) {
+                root.expand-clicked();
+            } else {
+                root.single-clicked();
+            }
         }
 
         double-clicked => {
             root.pointer-activity();
-            root.double-clicked();
+            if (!root.mini-mode && !root.suppress-clicks) {
+                root.double-clicked();
+            }
         }
 
         pointer-event(event) => {
@@ -46,7 +68,7 @@ export component VideoView inherits Rectangle {
     }
 
     // Minimalist monochrome idle placeholder when no video is active and not buffering
-    if !root.has-video && !root.is-buffering : Rectangle {
+    if !root.has-video && !root.is-buffering && !root.mini-mode : Rectangle {
         width: 240px;
         height: 160px;
         x: (parent.width - self.width) / 2;
@@ -106,8 +128,8 @@ export component VideoView inherits Rectangle {
 
     // Centered minimal arc loading spinner when opening or buffering media (no background card)
     if root.is-buffering : Rectangle {
-        width: 44px;
-        height: 44px;
+        width: root.mini-mode ? 28px : 44px;
+        height: self.width;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
 
@@ -116,8 +138,8 @@ export component VideoView inherits Rectangle {
 
         // Subtle translucent ring track
         Path {
-            width: 44px;
-            height: 44px;
+            width: parent.width;
+            height: parent.height;
             viewbox-x: 0;
             viewbox-y: 0;
             viewbox-width: 44;
@@ -149,8 +171,8 @@ export component VideoView inherits Rectangle {
             property <angle> start-angle: 360deg * Math.mod(animation-tick() / 1ms, 750) / 750;
             property <angle> end-angle: self.start-angle + 110deg;
 
-            width: 44px;
-            height: 44px;
+            width: parent.width;
+            height: parent.height;
             viewbox-x: 0;
             viewbox-y: 0;
             viewbox-width: 44;
@@ -171,5 +193,18 @@ export component VideoView inherits Rectangle {
                 sweep: true;
             }
         }
+    }
+
+    // Settled mini tile chrome: scrim, play/pause, expand, pause + minimize, progress line
+    if root.mini-chrome-visible : MiniOverlay {
+        width: 100%;
+        height: 100%;
+        is-playing: root.is-playing;
+        progress: root.progress;
+        media-title: root.media-title;
+        corner-radius: root.border-radius;
+        play-pause-clicked => { root.mini-play-pause-clicked(); }
+        expand-clicked => { root.expand-clicked(); }
+        minimize-clicked => { root.mini-minimize-clicked(); }
     }
 }

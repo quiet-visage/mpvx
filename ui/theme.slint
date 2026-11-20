@@ -37,6 +37,12 @@ export struct ChapterItem {
     current: bool,
 }
 
+export enum MiniState {
+    Hidden,
+    Tile,
+    Pill,
+}
+
 export enum AppViewMode {
     Picker,
     Player,
@@ -145,4 +151,26 @@ export global Theme {
     out property <color> progress-track: #ffffff38;
     out property <color> progress-fill: #818cf8;
     out property <color> pill-bg: #000000b3;
+
+    // --- Mini Player Tokens (docs/mini-player-ui-spec.md §6.1) ---
+    // The durations are read by C++ (settle timers), so the two sides cannot drift.
+    out property <duration> mini-shrink-duration: 300ms;
+    out property <duration> mini-expand-duration: 260ms;
+    out property <duration> mini-collapse-duration: 220ms;
+    out property <duration> mini-close-fade-duration: 160ms;
+    // Clicks on the video are ignored this long after leaving mini mode, so the second click
+    // of a double-click on the tile neither toggles pause nor fullscreen (§3.3).
+    out property <duration> mini-expand-click-guard: 500ms;
+    out property <length> mini-margin: 16px;
+    out property <length> mini-min-width: 280px;
+    out property <length> mini-max-width: 480px;
+    out property <float> mini-width-ratio: 0.26;
+    out property <length> mini-portrait-min-height: 220px;
+    out property <length> mini-portrait-max-height: 420px;
+    out property <float> mini-portrait-height-ratio: 0.40;
+    out property <color> mini-scrim: #00000066;
+    out property <length> mini-pill-height: 40px;
+    out property <length> mini-pill-min-width: 200px;
+    out property <length> mini-pill-max-width: 320px;
+    out property <length> mini-pill-radius: 20px;
 }

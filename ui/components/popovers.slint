@@ -90,6 +90,7 @@ component SettingsPill inherits Rectangle {
 
     accessible-role: button;
     accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
 
     Text {
         text: root.text;
@@ -115,6 +116,7 @@ export component PopoverLayer inherits Rectangle {
     in-out property <float> playback-speed: 1.0;
     in-out property <string> hwdec-mode: "auto-safe";
     in-out property <string> aspect-ratio: "auto";
+    in-out property <bool> mini-fps-cap: false;
     in property <string> media-title: "";
     in property <string> url-draft: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
 
@@ -130,6 +132,7 @@ export component PopoverLayer inherits Rectangle {
     callback speed-changed(float);
     callback hwdec-changed(string);
     callback aspect-changed(string);
+    callback mini-fps-cap-changed(bool);
 
     background: transparent;
 
@@ -424,10 +427,10 @@ export component PopoverLayer inherits Rectangle {
         }
     }
 
-    // 6. Quick Settings Popover (Speed, HWDEC, Aspect Ratio)
+    // 6. Quick Settings Popover (Speed, HWDEC, Aspect Ratio, Mini Player)
     if root.active-popover == ActivePopover.Settings : Rectangle {
         width: 300px;
-        height: 210px;
+        height: 266px;
         x: max(16px, parent.width - self.width - 36px);
         y: parent.height - Theme.bottom-gradient-height - self.height + 12px + (1.0 - root.open-progress) * 6px;
         background: Theme.popover-bg;
@@ -511,6 +514,28 @@ export component PopoverLayer inherits Rectangle {
                     clicked => {
                         root.aspect-ratio = ratio;
                         root.aspect-changed(ratio);
+                    }
+                }
+            }
+
+            // Mini Player (opt-in 30 fps cap, docs/mini-player-ui-spec.md §3.6)
+            Text {
+                text: "MINI PLAYER";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+
+                for opt[i] in ["Full rate", "30 fps"] : SettingsPill {
+                    horizontal-stretch: 1;
+                    text: opt;
+                    selected: (i == 1) == root.mini-fps-cap;
+                    clicked => {
+                        root.mini-fps-cap = (i == 1);
+                        root.mini-fps-cap-changed(root.mini-fps-cap);
                     }
                 }
             }
