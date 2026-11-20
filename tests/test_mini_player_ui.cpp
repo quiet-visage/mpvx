@@ -13,6 +13,7 @@
 #include <slint-testing.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -40,6 +41,11 @@ void settle_animations(uint64_t ms = 500) {
 void read_morph(const slint::ComponentHandle<MainWindow>& ui) {
     (void)ui->get_mini_t();
     (void)ui->get_collapse_t();
+}
+
+void read_tile_pos(const slint::ComponentHandle<MainWindow>& ui) {
+    (void)ui->get_mini_tile_x();
+    (void)ui->get_mini_tile_y();
 }
 
 bool near(float a, float b, float tol = 0.5f) {
@@ -426,4 +432,387 @@ TEST_CASE("Settings popover 30 fps option", "[ui][mini]") {
     REQUIRE(ui->get_mini_fps_cap() == false);
 
     REQUIRE(changes == std::vector<bool>{true, false});
+}
+
+TEST_CASE("Mini player drag below threshold clicks to expand; past threshold drags without expanding", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+
+    int expanded = 0;
+    ui->on_mini_expand_clicked([&]() { ++expanded; });
+
+    // Body point away from overlay buttons.
+    const float start_x = ui->get_mini_tile_x() + 40.0f;
+    const float start_y = ui->get_mini_tile_y() + ui->get_mini_h() / 2.0f;
+    const slint::LogicalPosition p0({start_x, start_y});
+    const slint::LogicalPosition p_jitter({start_x + 3.0f, start_y + 2.0f});
+
+    // Sub-threshold movement (< 6px) expands normally.
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_jitter);
+    REQUIRE_FALSE(ui->get_mini_dragging());
+    ui->window().dispatch_pointer_release_event(p_jitter, slint::PointerEventButton::Left);
+    REQUIRE(expanded == 1);
+
+    // Dragging past threshold (>= 6px) enters drag mode and does NOT expand on release.
+    const slint::LogicalPosition p_drag({start_x - 40.0f, start_y - 40.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_drag);
+    REQUIRE(ui->get_mini_dragging());
+    ui->window().dispatch_pointer_release_event(p_drag, slint::PointerEventButton::Left);
+    REQUIRE_FALSE(ui->get_mini_dragging());
+    REQUIRE(expanded == 1);
+}
+
+TEST_CASE("Mini player drags and snaps to nearest of four corners with spring settle", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    int expanded = 0;
+    ui->on_mini_expand_clicked([&]() { ++expanded; });
+
+    const float w = ui->get_mini_w();
+    const float h = ui->get_mini_h();
+
+    auto drag_body_to = [&](float target_cx, float target_cy) {
+        // Grab the tile body left of the 44px centre play/pause button.
+        const float grab_off_x = 40.0f;
+        const float grab_off_y = h / 2.0f;
+        const float gx0 = ui->get_mini_tile_x() + grab_off_x;
+        const float gy0 = ui->get_mini_tile_y() + grab_off_y;
+        const float gx1 = target_cx - w / 2.0f + grab_off_x;
+        const float gy1 = target_cy - h / 2.0f + grab_off_y;
+        const slint::LogicalPosition p0({gx0, gy0});
+        const slint::LogicalPosition p_mid({(gx0 + gx1) / 2.0f, (gy0 + gy1) / 2.0f});
+        const slint::LogicalPosition p1({gx1, gy1});
+        ui->window().dispatch_pointer_move_event(p0);
+        ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+        ui->window().dispatch_pointer_move_event(p_mid);
+        ui->window().dispatch_pointer_move_event(p1);
+        REQUIRE(ui->get_mini_dragging());
+        ui->window().dispatch_pointer_release_event(p1, slint::PointerEventButton::Left);
+        read_tile_pos(ui);
+    };
+
+    // Drag to top-left quadrant -> snaps to TopLeft (16, 72)
+    drag_body_to(220.0f, 180.0f);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::TopLeft);
+    REQUIRE(ui->get_mini_snapping());
+    settle_animations(300);
+    REQUIRE_FALSE(ui->get_mini_snapping());
+    REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+
+    // Drag to top-right quadrant -> snaps to TopRight (1280 - w - 16, 72)
+    drag_body_to(1080.0f, 190.0f);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::TopRight);
+    settle_animations(300);
+    REQUIRE(near(ui->get_mini_tile_x(), 1280.0f - w - 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+
+    // Drag to bottom-left quadrant -> snaps to BottomLeft (16, 720 - h - 16)
+    drag_body_to(220.0f, 580.0f);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomLeft);
+    settle_animations(300);
+    REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 720.0f - h - 16.0f));
+
+    // Drag to bottom-right quadrant -> snaps to BottomRight (1280 - w - 16, 720 - h - 16)
+    drag_body_to(1060.0f, 580.0f);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+    settle_animations(300);
+    REQUIRE(near(ui->get_mini_tile_x(), 1280.0f - w - 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 720.0f - h - 16.0f));
+
+    // Dragging past top-left window bounds clamps cleanly inside safe padding (8px left, 64px top).
+    const float gx0 = ui->get_mini_tile_x() + 40.0f;
+    const float gy0 = ui->get_mini_tile_y() + h / 2.0f;
+    ui->window().dispatch_pointer_move_event(slint::LogicalPosition({gx0, gy0}));
+    ui->window().dispatch_pointer_press_event(slint::LogicalPosition({gx0, gy0}), slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(slint::LogicalPosition({-200.0f, -200.0f}));
+    REQUIRE(near(ui->get_mini_tile_x(), 8.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 64.0f));
+    ui->window().dispatch_pointer_release_event(slint::LogicalPosition({-200.0f, -200.0f}), slint::PointerEventButton::Left);
+    read_tile_pos(ui);
+    settle_animations(300);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::TopLeft);
+    REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+    REQUIRE(expanded == 0);
+}
+
+TEST_CASE("Mini player can be grabbed mid-snap and redirected to another corner", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    const float w = ui->get_mini_w();
+    const float h = ui->get_mini_h();
+
+    // Start in BottomRight, drag toward TopLeft and release.
+    const slint::LogicalPosition p0({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p_tl({120.0f, 200.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_tl);
+    ui->window().dispatch_pointer_release_event(p_tl, slint::PointerEventButton::Left);
+    read_tile_pos(ui);
+    REQUIRE(ui->get_mini_snapping());
+
+    // Mid-flight at 90ms: grab the tile body (away from centre play button) and drag to TopRight.
+    settle_animations(90);
+    const slint::LogicalPosition p_grab({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p_tr({1000.0f, 190.0f});
+    ui->window().dispatch_pointer_move_event(p_grab);
+    ui->window().dispatch_pointer_press_event(p_grab, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_tr);
+    REQUIRE(ui->get_mini_dragging());
+    REQUIRE_FALSE(ui->get_mini_snapping());
+    ui->window().dispatch_pointer_release_event(p_tr, slint::PointerEventButton::Left);
+    read_tile_pos(ui);
+
+    REQUIRE(ui->get_mini_corner() == MiniCorner::TopRight);
+    settle_animations(300);
+    REQUIRE(near(ui->get_mini_tile_x(), 1280.0f - w - 16.0f));
+    REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+}
+
+TEST_CASE("Mini pill, picker inset, and window resize honor the snapped corner", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+
+    SECTION("TopLeft corner has zero bottom inset and collapses pill to TopLeft") {
+        ui->set_mini_corner(MiniCorner::TopLeft);
+        REQUIRE(near(ui->get_picker_bottom_inset(), 0.0f));
+        REQUIRE(near(ui->get_picker_top_clearance(), 72.0f + ui->get_mini_h() + 16.0f));
+        REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+        REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+
+        ui->set_is_playing(false);
+        ui->set_mini_state(MiniState::Pill);
+        read_morph(ui);
+        settle_animations();
+        REQUIRE(near(ui->get_picker_bottom_inset(), 0.0f));
+        REQUIRE(near(ui->get_picker_top_clearance(), 72.0f + 40.0f + 16.0f));
+        REQUIRE(near(ui->get_mini_pill_x(), 16.0f));
+        REQUIRE(near(ui->get_mini_pill_y(), 72.0f));
+
+        ui->set_mini_state(MiniState::Tile);
+        read_morph(ui);
+        settle_animations();
+        REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+        REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+    }
+
+    SECTION("BottomLeft corner keeps bottom inset and collapses pill to BottomLeft") {
+        ui->set_mini_corner(MiniCorner::BottomLeft);
+        REQUIRE(near(ui->get_picker_bottom_inset(), ui->get_mini_h() + 32.0f));
+        REQUIRE(near(ui->get_picker_top_clearance(), 0.0f));
+
+        ui->set_is_playing(false);
+        ui->set_mini_state(MiniState::Pill);
+        read_morph(ui);
+        settle_animations();
+        REQUIRE(near(ui->get_picker_bottom_inset(), 72.0f));
+        REQUIRE(near(ui->get_mini_pill_x(), 16.0f));
+        REQUIRE(near(ui->get_mini_pill_y(), 720.0f - 40.0f - 16.0f));
+    }
+
+    SECTION("TopRight corner stays anchored on window resize") {
+        ui->set_mini_corner(MiniCorner::TopRight);
+        ui->window().set_size(slint::LogicalSize({1600.0f, 900.0f}));
+        REQUIRE(near(ui->get_mini_tile_x(), 1600.0f - ui->get_mini_w() - 16.0f));
+        REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+    }
+}
+
+TEST_CASE("Interrupting a drag with expand or minimize resets drag state cleanly", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    const float h = ui->get_mini_h();
+
+    const slint::LogicalPosition p0({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p_tr({1000.0f, 190.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_tr);
+    REQUIRE(ui->get_mini_dragging());
+
+    SECTION("Minimize mid-drag snaps pill to the hovered corner") {
+        ui->set_is_playing(false);
+        ui->set_mini_state(MiniState::Pill);
+        read_morph(ui);
+        read_tile_pos(ui);
+        settle_animations(16); // flush deferred Slint `changed mini-state` callback
+        REQUIRE_FALSE(ui->get_mini_dragging());
+        REQUIRE(ui->get_mini_corner() == MiniCorner::TopRight);
+        settle_animations();
+        REQUIRE(near(ui->get_mini_pill_x(), 1280.0f - ui->get_pill_w() - 16.0f));
+        REQUIRE(near(ui->get_mini_pill_y(), 72.0f));
+    }
+
+    SECTION("Expand mid-drag clears drag state and returns to Player") {
+        const float drag_x = ui->get_mini_tile_x();
+        const float drag_y = ui->get_mini_tile_y();
+        ui->set_mini_state(MiniState::Hidden);
+        ui->set_view_mode(AppViewMode::Player);
+        read_morph(ui);
+        settle_animations(16); // flush deferred Slint `changed mini-state` callback
+        REQUIRE_FALSE(ui->get_mini_dragging());
+        // The morph starts from the dragged position: no corner commit, no snap (§12.4C).
+        REQUIRE_FALSE(ui->get_mini_snapping());
+        REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+        read_tile_pos(ui);
+        settle_animations(100);
+        REQUIRE(near(ui->get_mini_tile_x(), drag_x));
+        REQUIRE(near(ui->get_mini_tile_y(), drag_y));
+        settle_animations();
+        REQUIRE(near(ui->get_mini_t(), 0.0f, 0.001f));
+    }
+}
+
+TEST_CASE("Other mouse buttons mid-drag never leave the tile stuck or expand", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    int expanded = 0;
+    ui->on_mini_expand_clicked([&]() { ++expanded; });
+    const float h = ui->get_mini_h();
+
+    const slint::LogicalPosition p0({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p1({p0.x - 200.0f, p0.y - 100.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p1);
+    REQUIRE(ui->get_mini_dragging());
+    const float x1 = ui->get_mini_tile_x();
+
+    // Pressing another button keeps the drag going: the tile still tracks 1:1.
+    ui->window().dispatch_pointer_press_event(p1, slint::PointerEventButton::Right);
+    REQUIRE(ui->get_mini_dragging());
+    const slint::LogicalPosition p2({p1.x - 50.0f, p1.y});
+    ui->window().dispatch_pointer_move_event(p2);
+    REQUIRE(near(ui->get_mini_tile_x(), x1 - 50.0f));
+
+    // Releasing it ends Slint's pointer grab, so the drag ends there and snaps.
+    ui->window().dispatch_pointer_release_event(p2, slint::PointerEventButton::Right);
+    REQUIRE_FALSE(ui->get_mini_dragging());
+    REQUIRE(ui->get_mini_snapping());
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+
+    // The left release afterwards is neither a click nor a new drag.
+    ui->window().dispatch_pointer_release_event(p2, slint::PointerEventButton::Left);
+    REQUIRE(expanded == 0);
+    read_tile_pos(ui);
+    settle_animations(300);
+    REQUIRE_FALSE(ui->get_mini_snapping());
+    REQUIRE(near(ui->get_mini_tile_x(), 1280.0f - ui->get_mini_w() - 16.0f));
+}
+
+TEST_CASE("Pressing the tile mid-snap freezes it without a jump", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    int expanded = 0;
+    ui->on_mini_expand_clicked([&]() { ++expanded; });
+    const float h = ui->get_mini_h();
+
+    // Throw the tile from BottomRight toward TopLeft.
+    const slint::LogicalPosition p0({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p_rel({500.0f, 300.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p_rel);
+    ui->window().dispatch_pointer_release_event(p_rel, slint::PointerEventButton::Left);
+    read_tile_pos(ui);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::TopLeft);
+
+    settle_animations(60);
+    const float hx = ui->get_mini_tile_x();
+    const float hy = ui->get_mini_tile_y();
+    REQUIRE_FALSE(near(hx, 16.0f, 20.0f)); // still well short of the corner
+
+    const slint::LogicalPosition g({hx + 40.0f, hy + h / 2.0f});
+    ui->window().dispatch_pointer_move_event(g);
+    ui->window().dispatch_pointer_press_event(g, slint::PointerEventButton::Left);
+    REQUIRE_FALSE(ui->get_mini_snapping());
+
+    SECTION("held still: no drift, and jitter below the threshold does not start a drag") {
+        settle_animations(60);
+        REQUIRE(near(ui->get_mini_tile_x(), hx));
+        REQUIRE(near(ui->get_mini_tile_y(), hy));
+        ui->window().dispatch_pointer_move_event(slint::LogicalPosition({g.x + 1.0f, g.y}));
+        REQUIRE_FALSE(ui->get_mini_dragging());
+        REQUIRE(near(ui->get_mini_tile_x(), hx));
+
+        // Releasing is a click (expand) and lets the snap finish.
+        ui->window().dispatch_pointer_release_event(slint::LogicalPosition({g.x + 1.0f, g.y}),
+                                                    slint::PointerEventButton::Left);
+        REQUIRE(expanded == 1);
+        REQUIRE(ui->get_mini_snapping());
+        read_tile_pos(ui);
+        settle_animations(300);
+        REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+        REQUIRE(near(ui->get_mini_tile_y(), 72.0f));
+    }
+
+    SECTION("dragging after a pause moves the tile by exactly the pointer delta") {
+        settle_animations(60);
+        ui->window().dispatch_pointer_move_event(slint::LogicalPosition({g.x + 40.0f, g.y + 30.0f}));
+        REQUIRE(ui->get_mini_dragging());
+        REQUIRE(near(ui->get_mini_tile_x(), hx + 40.0f));
+        REQUIRE(near(ui->get_mini_tile_y(), hy + 30.0f));
+        ui->window().dispatch_pointer_release_event(slint::LogicalPosition({g.x + 40.0f, g.y + 30.0f}),
+                                                    slint::PointerEventButton::Left);
+        REQUIRE(expanded == 0);
+    }
+}
+
+TEST_CASE("The tile cannot be dragged until the shrink morph finishes", "[ui][mini]") {
+    ensure_slint_testing_backend();
+    auto ui = MainWindow::create();
+    ui->window().set_size(slint::LogicalSize({1280.0f, 720.0f}));
+    ui->show();
+    ui->set_has_video(true);
+    ui->set_is_playing(true);
+    ui->set_view_mode(AppViewMode::Picker);
+    ui->set_mini_state(MiniState::Tile);
+    read_morph(ui);
+    settle_animations(150);
+
+    const float t = ui->get_mini_t();
+    REQUIRE(t >= 0.95f);
+    REQUIRE(t < 1.0f);
+    const float w = ui->get_mini_w();
+    const float h = ui->get_mini_h();
+    const float x = (1280.0f - w - 16.0f) * t;
+    const float y = (720.0f - h - 16.0f) * t;
+    const slint::LogicalPosition p0({x + 40.0f, y + h / 2.0f});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(slint::LogicalPosition({p0.x - 80.0f, p0.y - 80.0f}));
+    REQUIRE_FALSE(ui->get_mini_dragging());
+    ui->window().dispatch_pointer_release_event(slint::LogicalPosition({p0.x - 80.0f, p0.y - 80.0f}),
+                                                slint::PointerEventButton::Left);
+    REQUIRE_FALSE(ui->get_mini_snapping());
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+}
+
+TEST_CASE("The snap overshoot stays inside the drag pads on a large window", "[ui][mini]") {
+    auto ui = make_window_in_tile("Episode 04");
+    ui->window().set_size(slint::LogicalSize({2560.0f, 1440.0f}));
+    ui->set_mini_corner(MiniCorner::BottomLeft);
+    const float w = ui->get_mini_w();
+    const float h = ui->get_mini_h();
+    REQUIRE(near(ui->get_mini_tile_x(), 16.0f));
+
+    // Release just right of centre: about 1000px of travel to the right corner.
+    const slint::LogicalPosition p0({ui->get_mini_tile_x() + 40.0f, ui->get_mini_tile_y() + h / 2.0f});
+    const slint::LogicalPosition p1({1060.0f + 40.0f, p0.y});
+    ui->window().dispatch_pointer_move_event(p0);
+    ui->window().dispatch_pointer_press_event(p0, slint::PointerEventButton::Left);
+    ui->window().dispatch_pointer_move_event(p1);
+    ui->window().dispatch_pointer_release_event(p1, slint::PointerEventButton::Left);
+    read_tile_pos(ui);
+    REQUIRE(ui->get_mini_corner() == MiniCorner::BottomRight);
+
+    float max_x = 0.0f;
+    for (int i = 0; i < 20; ++i) {
+        settle_animations(16);
+        max_x = std::max(max_x, ui->get_mini_tile_x());
+    }
+    REQUIRE(max_x <= 2560.0f - w - 8.0f + 0.5f);
+    settle_animations(300);
+    REQUIRE(near(ui->get_mini_tile_x(), 2560.0f - w - 16.0f));
 }
