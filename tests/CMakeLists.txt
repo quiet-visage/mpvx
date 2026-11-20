@@ -1,8 +1,10 @@
 add_executable(mpvx_tests
     test_player.cpp
+    test_renderer.cpp
     test_controls_ui.cpp
     test_library.cpp
     test_picker_ui.cpp
+    test_mini_player_ui.cpp
 )
 
 target_link_libraries(mpvx_tests
@@ -15,9 +17,13 @@ target_link_libraries(mpvx_tests
 
 target_compile_features(mpvx_tests PRIVATE cxx_std_26)
 
+# Element debug info lets tests query the UI with slint::testing::ElementHandle
+# (accessible labels, default actions). Test target only; the app build is unaffected.
+set(SLINT_COMPILER_ENV_VARS SLINT_EMIT_DEBUG_INFO=1)
 slint_target_sources(mpvx_tests
     ../ui/app-window.slint
 )
+unset(SLINT_COMPILER_ENV_VARS)
 
 if(UNIX AND NOT APPLE)
     set(_DEPS_LIB_DIR "${CMAKE_SOURCE_DIR}/.deps/libmpv/lib")

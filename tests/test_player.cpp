@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -545,3 +546,62 @@ TEST_CASE("Player play/pause state consistency across load, pause-while-loading,
 
 
 
+
+TEST_CASE("Player tells playlist advance from real idleness", "[player][state][mini]") {
+    // The mini player closes only on real idleness (docs/mini-player-ui-spec.md §3.7, §8):
+    // END_FILE between playlist entries reports Idle, but is_idle_active() stays false.
+    mpvx::Player player;
+    REQUIRE(player.initialize().has_value());
+    mpv_set_property_string(player.handle(), "vo", "null");
+    mpv_set_property_string(player.handle(), "ao", "null");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+    std::mutex mu;
+    std::vector<bool> idle_active_at_idle; // is_idle_active() at each Idle notification
+    std::atomic<bool> finished{false};
+    mpvx::PlayerCallbacks cbs;
+    cbs.on_state_changed = [&](mpvx::PlaybackState st) {
+        if (st != mpvx::PlaybackState::Idle) return;
+        const bool idle_active = player.is_idle_active();
+        {
+            std::lock_guard lock(mu);
+            idle_active_at_idle.push_back(idle_active);
+        }
+        if (idle_active) finished.store(true);
+    };
+    player.set_callbacks(std::move(cbs));
+
+    REQUIRE(player.load_file("av://lavfi:testsrc=duration=1:size=160x120:rate=15").has_value());
+    for (int i = 0; i < 40 && player.state() == mpvx::PlaybackState::Idle; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(player.state() != mpvx::PlaybackState::Idle); // entry 1 loaded; now append entry 2
+    const char* append[] = {"loadfile", "av://lavfi:testsrc=duration=0.3:size=160x120:rate=15", "append", nullptr};
+    REQUIRE(mpv_command(player.handle(), append) >= 0);
+    REQUIRE(wait_mpv_prop_equals(player.handle(), "playlist-count", "2"));
+
+    // Entry 1 ends and mpv advances to entry 2 (keep-open=yes only holds the last entry).
+    auto idle_count = [&] {
+        std::lock_guard lock(mu);
+        return idle_active_at_idle.size();
+    };
+    for (int i = 0; i < 200 && (idle_count() == 0 || player.state() == mpvx::PlaybackState::Idle); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(idle_count() >= 1);
+    REQUIRE(player.state() != mpvx::PlaybackState::Idle); // entry 2 loaded
+    REQUIRE_FALSE(finished.load());
+
+    // Ending the session is real idleness.
+    REQUIRE(player.stop().has_value());
+    for (int i = 0; i < 100 && !finished.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(finished.load());
+
+    std::lock_guard lock(mu);
+    REQUIRE(idle_active_at_idle.size() >= 2);
+    REQUIRE_FALSE(idle_active_at_idle.front()); // advancing to entry 2 is not idleness
+    REQUIRE(idle_active_at_idle.back());        // the playlist ran out
+    player.shutdown();
+}
