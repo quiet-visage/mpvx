@@ -72,6 +72,19 @@ struct Chapter {
     double time{0.0};
 };
 
+// Display size of the video as mpv will present it (after filters, aspect override and
+// rotation). {0, 0} when no video is active.
+struct VideoDisplaySize {
+    int width{0};
+    int height{0};
+
+    [[nodiscard]] constexpr bool valid() const noexcept { return width > 0 && height > 0; }
+    [[nodiscard]] constexpr double aspect() const noexcept {
+        return valid() ? static_cast<double>(width) / static_cast<double>(height) : 0.0;
+    }
+    constexpr bool operator==(const VideoDisplaySize&) const noexcept = default;
+};
+
 [[nodiscard]] inline std::string format_timestamp(double seconds) {
     if (seconds < 0.0 || std::isnan(seconds) || std::isinf(seconds)) {
         seconds = 0.0;

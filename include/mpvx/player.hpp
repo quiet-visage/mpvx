@@ -20,6 +20,9 @@ namespace mpvx {
 
 [[nodiscard]] std::vector<MediaTrack> parse_track_list_node(const mpv_node& root);
 [[nodiscard]] std::vector<Chapter> parse_chapter_list_node(const mpv_node& root);
+// Parses an mpv `video-out-params` map into its display size (dw/dh, swapped for
+// 90/270 degree rotation). Returns {0, 0} for anything that is not a valid map.
+[[nodiscard]] VideoDisplaySize parse_video_out_params_node(const mpv_node& root);
 
 class Player {
 public:
@@ -75,6 +78,11 @@ public:
     [[nodiscard]] Result<void> set_hwdec(std::string_view mode);
     [[nodiscard]] Result<void> set_aspect_override(std::string_view aspect);
 
+    // Mini player profile: hides subtitles and the OSD (both slow down SW rendering and are
+    // unreadable at tile size). Leaving restores the values in effect before entering.
+    // Idempotent; asynchronous mpv calls only, so it is safe on the GUI thread.
+    [[nodiscard]] Result<void> set_mini_profile(bool mini);
+
     // One-shot resume target applied automatically on MPV_EVENT_FILE_LOADED
     void set_pending_resume(double seconds) noexcept;
     void clear_pending_resume() noexcept;
@@ -85,7 +93,14 @@ public:
     [[nodiscard]] bool is_muted() const noexcept;
     [[nodiscard]] bool is_buffering() const noexcept;
     [[nodiscard]] PlaybackState state() const noexcept;
+    // True once a pause has been requested (pause()) or observed, even before mpv confirms
+    // it; false once a resume has been requested or observed.
+    [[nodiscard]] bool is_paused() const noexcept;
+    // mpv's `idle-active`: no file is loaded or loading. Unlike PlaybackState::Idle (which
+    // is also reported between playlist entries on END_FILE), this means playback is over.
+    [[nodiscard]] bool is_idle_active() const noexcept;
     [[nodiscard]] std::string media_title() const;
+    [[nodiscard]] VideoDisplaySize video_display_size() const noexcept;
 
     void set_callbacks(PlayerCallbacks callbacks);
 
@@ -99,6 +114,7 @@ private:
     void update_playback_state(PlaybackState next_state, bool force_notify = false);
     void set_buffering_state(bool buffering);
     void recompute_buffering_state();
+    void publish_video_size(VideoDisplaySize size, bool notify_if_unchanged);
 
     mpv_handle* mpv_{nullptr};
     std::atomic<bool> running_{false};
@@ -109,6 +125,7 @@ private:
 
     std::atomic<PlaybackState> state_{PlaybackState::Idle};
     std::atomic<bool> paused_{false};
+    std::atomic<bool> idle_active_{true}; // mpv starts idle (idle=yes)
     std::atomic<bool> file_loaded_{false};
     std::atomic<bool> eof_reached_{false};
     std::atomic<double> duration_{0.0};
@@ -126,6 +143,12 @@ private:
     std::atomic<double> pending_resume_sec_{-1.0};
     std::atomic<LoopMode> loop_mode_{LoopMode::Off};
     std::atomic<AbLoopState> ab_loop_state_{AbLoopState::Off};
+    std::atomic<uint64_t> video_size_{0}; // (width << 32) | height
+    std::atomic<bool> sub_visibility_{true};
+    std::atomic<int64_t> osd_level_{1};
+    std::atomic<bool> mini_profile_{false};
+    std::atomic<bool> saved_sub_visibility_{true};
+    std::atomic<int64_t> saved_osd_level_{1};
 
     std::optional<double> ab_loop_a_;
     std::optional<double> ab_loop_b_;

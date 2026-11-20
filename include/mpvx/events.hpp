@@ -28,6 +28,9 @@ struct PlayerCallbacks {
     std::function<void(AbLoopState, std::optional<double> a, std::optional<double> b)> on_ab_loop_changed;
     std::function<void(LoopMode)> on_loop_mode_changed;
     std::function<void(double speed)> on_speed_changed;
+
+    // Video display size changed (new file, aspect override, rotation); {0, 0} when no video.
+    std::function<void(VideoDisplaySize)> on_video_size;
 };
 
 } // namespace mpvx

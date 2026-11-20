@@ -60,6 +60,39 @@ std::vector<MediaTrack> parse_track_list_node(const mpv_node& root) {
     return result;
 }
 
+VideoDisplaySize parse_video_out_params_node(const mpv_node& root) {
+    if (root.format != MPV_FORMAT_NODE_MAP || !root.u.list) {
+        return {};
+    }
+
+    int64_t dw = 0;
+    int64_t dh = 0;
+    int64_t rotate = 0;
+    const mpv_node_list* map = root.u.list;
+    for (int k = 0; k < map->num; ++k) {
+        if (!map->keys || !map->keys[k]) continue;
+        std::string_view key(map->keys[k]);
+        const mpv_node& val = map->values[k];
+        if (val.format != MPV_FORMAT_INT64) continue;
+        if (key == "dw") {
+            dw = val.u.int64;
+        } else if (key == "dh") {
+            dh = val.u.int64;
+        } else if (key == "rotate") {
+            rotate = val.u.int64;
+        }
+    }
+
+    constexpr int64_t kMaxSide = 1 << 16;
+    if (dw <= 0 || dh <= 0 || dw > kMaxSide || dh > kMaxSide) {
+        return {};
+    }
+    if (((rotate % 360) + 360) % 180 == 90) {
+        std::swap(dw, dh);
+    }
+    return VideoDisplaySize{static_cast<int>(dw), static_cast<int>(dh)};
+}
+
 std::vector<Chapter> parse_chapter_list_node(const mpv_node& root) {
     std::vector<Chapter> result;
     if (root.format != MPV_FORMAT_NODE_ARRAY || !root.u.list) {
@@ -123,6 +156,7 @@ Player& Player::operator=(Player&& other) noexcept {
         }
         state_.store(other.state_.load());
         paused_.store(other.paused_.load());
+        idle_active_.store(other.idle_active_.load());
         file_loaded_.store(other.file_loaded_.load());
         eof_reached_.store(other.eof_reached_.load());
         duration_.store(other.duration_.load());
@@ -138,6 +172,12 @@ Player& Player::operator=(Player&& other) noexcept {
         current_chapter_.store(other.current_chapter_.load());
         loop_mode_.store(other.loop_mode_.load());
         ab_loop_state_.store(other.ab_loop_state_.load());
+        video_size_.store(other.video_size_.load());
+        sub_visibility_.store(other.sub_visibility_.load());
+        osd_level_.store(other.osd_level_.load());
+        mini_profile_.store(other.mini_profile_.load());
+        saved_sub_visibility_.store(other.saved_sub_visibility_.load());
+        saved_osd_level_.store(other.saved_osd_level_.load());
         {
             std::scoped_lock lock(mutex_, other.mutex_);
             callbacks_ = std::move(other.callbacks_);
@@ -209,6 +249,9 @@ void Player::observe_properties() {
     mpv_observe_property(mpv_, 0, "loop-playlist", MPV_FORMAT_NODE);
     mpv_observe_property(mpv_, 0, "speed", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv_, 0, "playlist-pos", MPV_FORMAT_INT64);
+    mpv_observe_property(mpv_, 0, "video-out-params", MPV_FORMAT_NODE);
+    mpv_observe_property(mpv_, 0, "sub-visibility", MPV_FORMAT_FLAG);
+    mpv_observe_property(mpv_, 0, "osd-level", MPV_FORMAT_INT64);
 }
 
 void Player::shutdown() {
@@ -634,6 +677,29 @@ Result<void> Player::set_aspect_override(std::string_view aspect) {
     return {};
 }
 
+Result<void> Player::set_mini_profile(bool mini) {
+    if (!mpv_) return std::unexpected(PlayerError{-1, "Player not initialized"});
+    if (mini_profile_.exchange(mini, std::memory_order_acq_rel) == mini) {
+        return {}; // already in the requested profile; keep the saved values intact
+    }
+
+    int sub_vis = 0;
+    int64_t osd = 0;
+    if (mini) {
+        saved_sub_visibility_.store(sub_visibility_.load(std::memory_order_acquire), std::memory_order_release);
+        saved_osd_level_.store(osd_level_.load(std::memory_order_acquire), std::memory_order_release);
+    } else {
+        sub_vis = saved_sub_visibility_.load(std::memory_order_acquire) ? 1 : 0;
+        osd = saved_osd_level_.load(std::memory_order_acquire);
+    }
+
+    const int s1 = mpv_set_property_async(mpv_, 0, "sub-visibility", MPV_FORMAT_FLAG, &sub_vis);
+    const int s2 = mpv_set_property_async(mpv_, 0, "osd-level", MPV_FORMAT_INT64, &osd);
+    const int status = s1 < 0 ? s1 : s2;
+    if (status < 0) return std::unexpected(PlayerError{status, mpv_error_string(status)});
+    return {};
+}
+
 void Player::set_pending_resume(double seconds) noexcept {
     pending_resume_sec_.store(seconds, std::memory_order_release);
 }
@@ -707,9 +773,35 @@ PlaybackState Player::state() const noexcept {
     return state_.load();
 }
 
+bool Player::is_paused() const noexcept {
+    return paused_.load(std::memory_order_acquire);
+}
+
+bool Player::is_idle_active() const noexcept {
+    return idle_active_.load(std::memory_order_acquire);
+}
+
 std::string Player::media_title() const {
     std::lock_guard lock(mutex_);
     return media_title_;
+}
+
+VideoDisplaySize Player::video_display_size() const noexcept {
+    const uint64_t packed = video_size_.load(std::memory_order_acquire);
+    return VideoDisplaySize{static_cast<int>(packed >> 32), static_cast<int>(packed & 0xFFFFFFFFu)};
+}
+
+void Player::publish_video_size(VideoDisplaySize size, bool notify_if_unchanged) {
+    const uint64_t packed = (static_cast<uint64_t>(static_cast<uint32_t>(size.width)) << 32) |
+                            static_cast<uint32_t>(size.height);
+    const bool changed = video_size_.exchange(packed, std::memory_order_acq_rel) != packed;
+    if (!changed && !notify_if_unchanged) return;
+    std::function<void(VideoDisplaySize)> cb;
+    {
+        std::lock_guard lock(mutex_);
+        cb = callbacks_.on_video_size;
+    }
+    if (cb) cb(size);
 }
 
 void Player::set_callbacks(PlayerCallbacks callbacks) {
@@ -812,6 +904,7 @@ void Player::handle_mpv_event(void* event_ptr) {
             } else if (name == "idle-active") {
                 if (prop->format == MPV_FORMAT_FLAG && prop->data) {
                     bool is_idle = *static_cast<int*>(prop->data) != 0;
+                    idle_active_.store(is_idle, std::memory_order_release);
                     if (is_idle) {
                         file_loaded_.store(false, std::memory_order_release);
                         eof_reached_.store(false, std::memory_order_release);
@@ -819,7 +912,10 @@ void Player::handle_mpv_event(void* event_ptr) {
                         seeking_.store(false);
                         core_idle_.store(false);
                         paused_for_cache_.store(false);
-                        update_playback_state(PlaybackState::Idle);
+                        // Force a notification: END_FILE usually reported Idle already, and
+                        // listeners need this second one to tell "playlist over" (is_idle_active())
+                        // from "between playlist entries".
+                        update_playback_state(PlaybackState::Idle, /*force_notify=*/true);
                         set_buffering_state(false);
                     }
                 }
@@ -948,6 +1044,14 @@ void Player::handle_mpv_event(void* event_ptr) {
                     }
                     if (cb) cb(st, a_opt, b_opt);
                 }
+            } else if (name == "sub-visibility") {
+                if (prop->format == MPV_FORMAT_FLAG && prop->data) {
+                    sub_visibility_.store(*static_cast<int*>(prop->data) != 0, std::memory_order_release);
+                }
+            } else if (name == "osd-level") {
+                if (prop->format == MPV_FORMAT_INT64 && prop->data) {
+                    osd_level_.store(*static_cast<int64_t*>(prop->data), std::memory_order_release);
+                }
             } else if (name == "speed") {
                 if (prop->format == MPV_FORMAT_DOUBLE && prop->data) {
                     double s = *static_cast<double*>(prop->data);
@@ -963,6 +1067,13 @@ void Player::handle_mpv_event(void* event_ptr) {
                 if (prop->format == MPV_FORMAT_INT64 && prop->data) {
                     playlist_pos_.store(*static_cast<int64_t*>(prop->data), std::memory_order_release);
                 }
+            } else if (name == "video-out-params") {
+                // MPV_FORMAT_NONE (no video) maps to {0, 0}.
+                VideoDisplaySize size{};
+                if (prop->format == MPV_FORMAT_NODE && prop->data) {
+                    size = parse_video_out_params_node(*static_cast<mpv_node*>(prop->data));
+                }
+                publish_video_size(size, /*notify_if_unchanged=*/false);
             }
             break;
         }
